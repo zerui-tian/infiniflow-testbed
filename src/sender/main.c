@@ -146,10 +146,12 @@ static int parse_app_args(int argc, char **argv, sender_config_t *cfg) {
     return 0;
 }
 
-static int init_port(uint16_t port_id) {
+static int init_port(uint16_t port_id, uint32_t packet_size) {
     struct rte_eth_conf port_conf;
+    struct rte_eth_dev_info dev_info;
     const uint16_t nb_rx_queue = 0;
     const uint16_t nb_tx_queue = 1;
+    uint16_t desired_mtu = 0;
     int rc = 0;
 
     memset(&port_conf, 0, sizeof(port_conf));
@@ -158,6 +160,23 @@ static int init_port(uint16_t port_id) {
     rc = rte_eth_dev_configure(port_id, nb_rx_queue, nb_tx_queue, &port_conf);
     if (rc < 0) {
         return rc;
+    }
+
+    if (packet_size > RTE_ETHER_MTU + RTE_ETHER_HDR_LEN) {
+        desired_mtu = (uint16_t)(packet_size - RTE_ETHER_HDR_LEN);
+
+        rc = rte_eth_dev_info_get(port_id, &dev_info);
+        if (rc < 0) {
+            return rc;
+        }
+        if (desired_mtu > dev_info.max_mtu) {
+            return -1;
+        }
+
+        rc = rte_eth_dev_set_mtu(port_id, desired_mtu);
+        if (rc < 0) {
+            return rc;
+        }
     }
 
     rc = rte_eth_tx_queue_setup(port_id, 0, 1024, rte_eth_dev_socket_id(port_id), NULL);
@@ -260,6 +279,7 @@ static void cleanup_sender(sender_ctx_t *ctx) {
 int main(int argc, char **argv) {
     sender_ctx_t ctx;
     uint32_t max_vc_csv = 0;
+    uint32_t data_room_size = 0;
     int eal_argc = 0;
     unsigned int producer_lcore = 0;
     unsigned int forward_lcore = 0;
@@ -306,8 +326,9 @@ int main(int argc, char **argv) {
         rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+IPv4+FC headers\n");
     }
 
-    if (ctx.cfg.packet_size > RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM) {
-        rte_exit(EXIT_FAILURE, "Packet size too large for default mbuf data room\n");
+    data_room_size = ctx.cfg.packet_size + RTE_PKTMBUF_HEADROOM;
+    if (data_room_size > UINT16_MAX) {
+        rte_exit(EXIT_FAILURE, "Packet size too large for mbuf data room\n");
     }
 
     ctx.hz = rte_get_timer_hz();
@@ -315,12 +336,12 @@ int main(int argc, char **argv) {
 
     ctx.mbuf_pool =
         rte_pktmbuf_pool_create("sender_mbuf_pool", ctx.cfg.mempool_size, MBUF_CACHE_SIZE, 0,
-                                RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+                                (uint16_t)data_room_size, rte_socket_id());
     if (ctx.mbuf_pool == NULL) {
         rte_exit(EXIT_FAILURE, "mempool create failed\n");
     }
 
-    if (init_port(ctx.cfg.port_id) != 0) {
+    if (init_port(ctx.cfg.port_id, ctx.cfg.packet_size) != 0) {
         rte_exit(EXIT_FAILURE, "port init failed\n");
     }
 

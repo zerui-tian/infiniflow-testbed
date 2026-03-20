@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(infiniflow_sender C)
 
+add_compile_definitions(_GNU_SOURCE)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
