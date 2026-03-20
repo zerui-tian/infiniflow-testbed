@@ -11,6 +11,7 @@ typedef struct receiver_config_s {
     uint16_t port_id;
     uint16_t rx_queue_id;
     uint32_t rx_burst_size;
+    uint32_t packet_size;
     uint32_t mempool_size;
     const char *output_path;
 } receiver_config_t;

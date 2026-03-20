@@ -19,6 +19,7 @@
 
 #define DEFAULT_MEMPOOL_SIZE 32768U
 #define DEFAULT_RX_BURST 64U
+#define DEFAULT_PKT_SIZE 8000U
 #define DEFAULT_OUTPUT_PATH "receiver_flow_stats.csv"
 #define MBUF_CACHE_SIZE 256U
 #define FLOW_TABLE_INIT_CAP 1024U
@@ -64,6 +65,7 @@ static void usage(const char *prog) {
     printf("Options:\n");
     printf("  --port <id>          NIC port id (default: 0)\n");
     printf("  --rx-burst <num>     RX burst size (default: 64)\n");
+    printf("  --pkt-size <bytes>   Expected packet size in bytes (default: 8000)\n");
     printf("  --mempool <num>      Mempool object count (default: 32768)\n");
     printf("  --output <path>      Output CSV file path (default: receiver_flow_stats.csv)\n");
 }
@@ -72,6 +74,7 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
     static const struct option long_opts[] = {
         {"port", required_argument, 0, 'p'},
         {"rx-burst", required_argument, 0, 'b'},
+        {"pkt-size", required_argument, 0, 's'},
         {"mempool", required_argument, 0, 'm'},
         {"output", required_argument, 0, 'o'},
         {0, 0, 0, 0},
@@ -79,7 +82,7 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
 
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:b:m:o:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:b:s:m:o:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 if (parse_u16(optarg, &cfg->port_id) != 0) {
@@ -88,6 +91,11 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
                 break;
             case 'b':
                 if (parse_u32(optarg, &cfg->rx_burst_size) != 0) {
+                    return -1;
+                }
+                break;
+            case 's':
+                if (parse_u32(optarg, &cfg->packet_size) != 0) {
                     return -1;
                 }
                 break;
@@ -104,7 +112,8 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
         }
     }
 
-    if (cfg->rx_burst_size == 0U || cfg->mempool_size == 0U || cfg->output_path == NULL) {
+    if (cfg->rx_burst_size == 0U || cfg->packet_size == 0U || cfg->mempool_size == 0U ||
+        cfg->output_path == NULL) {
         return -1;
     }
 
@@ -113,7 +122,9 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
 
 static int init_port(receiver_ctx_t *ctx) {
     struct rte_eth_conf port_conf;
+    struct rte_eth_dev_info dev_info;
     uint16_t nb_rxd = 1024;
+    uint16_t desired_mtu = 0;
     int rc = 0;
 
     memset(&port_conf, 0, sizeof(port_conf));
@@ -127,6 +138,23 @@ static int init_port(receiver_ctx_t *ctx) {
                                 rte_eth_dev_socket_id(ctx->cfg.port_id), NULL, ctx->mbuf_pool);
     if (rc < 0) {
         return rc;
+    }
+
+    if (ctx->cfg.packet_size > RTE_ETHER_MTU + RTE_ETHER_HDR_LEN) {
+        desired_mtu = (uint16_t)(ctx->cfg.packet_size - RTE_ETHER_HDR_LEN);
+
+        rc = rte_eth_dev_info_get(ctx->cfg.port_id, &dev_info);
+        if (rc < 0) {
+            return rc;
+        }
+        if (desired_mtu > dev_info.max_mtu) {
+            return -1;
+        }
+
+        rc = rte_eth_dev_set_mtu(ctx->cfg.port_id, desired_mtu);
+        if (rc < 0) {
+            return rc;
+        }
     }
 
     rc = rte_eth_dev_start(ctx->cfg.port_id);
@@ -356,6 +384,7 @@ static void cleanup_receiver(receiver_ctx_t *ctx) {
 int main(int argc, char **argv) {
     receiver_ctx_t ctx;
     struct rte_mbuf *rx_pkts[MAX_RX_BURST];
+    uint32_t data_room_size = 0;
     uint16_t burst = 0;
     int eal_argc = 0;
     int rc = 0;
@@ -364,6 +393,7 @@ int main(int argc, char **argv) {
     ctx.cfg.port_id = 0;
     ctx.cfg.rx_queue_id = 0;
     ctx.cfg.rx_burst_size = DEFAULT_RX_BURST;
+    ctx.cfg.packet_size = DEFAULT_PKT_SIZE;
     ctx.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
     ctx.cfg.output_path = DEFAULT_OUTPUT_PATH;
 
@@ -387,8 +417,13 @@ int main(int argc, char **argv) {
     ctx.hz = rte_get_timer_hz();
     ctx.start_cycles = rte_get_timer_cycles();
 
+    data_room_size = ctx.cfg.packet_size + RTE_PKTMBUF_HEADROOM;
+    if (data_room_size > UINT16_MAX) {
+        rte_exit(EXIT_FAILURE, "Packet size too large for mbuf data room\n");
+    }
+
     ctx.mbuf_pool = rte_pktmbuf_pool_create("receiver_mbuf_pool", ctx.cfg.mempool_size,
-                                            MBUF_CACHE_SIZE, 0, RTE_MBUF_DEFAULT_BUF_SIZE,
+                                            MBUF_CACHE_SIZE, 0, (uint16_t)data_room_size,
                                             rte_socket_id());
     if (ctx.mbuf_pool == NULL) {
         rte_exit(EXIT_FAILURE, "mempool create failed\n");
