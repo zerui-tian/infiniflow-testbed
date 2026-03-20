@@ -14,7 +14,6 @@
 #include <rte_eal.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
-#include <rte_ip.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
@@ -322,8 +321,8 @@ int main(int argc, char **argv) {
         rte_exit(EXIT_FAILURE, "CSV vc id exceeds configured --vcs\n");
     }
 
-    if (ctx.cfg.packet_size < (RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr) + FC_HEADER_SIZE)) {
-        rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+IPv4+FC headers\n");
+    if (ctx.cfg.packet_size < (RTE_ETHER_HDR_LEN + FC_HEADER_SIZE)) {
+        rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+FC headers\n");
     }
 
     data_room_size = ctx.cfg.packet_size + RTE_PKTMBUF_HEADROOM;

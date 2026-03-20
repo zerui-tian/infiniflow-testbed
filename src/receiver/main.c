@@ -13,7 +13,6 @@
 #include <rte_eal.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
-#include <rte_ip.h>
 #include <rte_mbuf.h>
 #include <rte_cycles.h>
 
@@ -265,9 +264,7 @@ static int update_flow_stats(receiver_ctx_t *ctx, uint32_t flow_id, uint64_t ts_
 
 static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     const struct rte_ether_hdr *eth_hdr = NULL;
-    const struct rte_ipv4_hdr *ipv4_hdr = NULL;
     const fc_header_t *fc_hdr = NULL;
-    uint32_t ipv4_hdr_len = 0;
     uint32_t min_len = 0;
     uint32_t flow_id = 0;
     uint64_t ts_cycles = 0;
@@ -277,30 +274,16 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     }
 
     eth_hdr = rte_pktmbuf_mtod(mbuf, const struct rte_ether_hdr *);
-    if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+    if (eth_hdr->ether_type != rte_cpu_to_be_16(FC_ETHER_TYPE)) {
         return 0;
     }
 
-    min_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(fc_header_t);
+    min_len = sizeof(struct rte_ether_hdr) + sizeof(fc_header_t);
     if (mbuf->pkt_len < min_len) {
         return 0;
     }
 
-    ipv4_hdr = (const struct rte_ipv4_hdr *)((const char *)eth_hdr + sizeof(*eth_hdr));
-    ipv4_hdr_len = (uint32_t)(ipv4_hdr->version_ihl & 0x0FU) * 4U;
-    if (ipv4_hdr_len < sizeof(struct rte_ipv4_hdr)) {
-        return 0;
-    }
-
-    if (ipv4_hdr->next_proto_id != FC_IPPROTO) {
-        return 0;
-    }
-
-    if (mbuf->pkt_len < sizeof(struct rte_ether_hdr) + ipv4_hdr_len + sizeof(fc_header_t)) {
-        return 0;
-    }
-
-    fc_hdr = (const fc_header_t *)((const char *)ipv4_hdr + ipv4_hdr_len);
+    fc_hdr = (const fc_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
     flow_id = rte_be_to_cpu_32(fc_hdr->flow_id);
     ts_cycles = rte_get_timer_cycles();
 
