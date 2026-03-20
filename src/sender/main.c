@@ -1,4 +1,5 @@
 #include "sender/sender_ctx.h"
+#include "core/fc_header.h"
 
 #include <inttypes.h>
 #include <errno.h>
@@ -11,7 +12,9 @@
 
 #include <rte_cycles.h>
 #include <rte_eal.h>
+#include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_ip.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
@@ -23,7 +26,6 @@
 #define DEFAULT_TX_BURST 64U
 #define DEFAULT_TICK_US 1000U
 #define MBUF_CACHE_SIZE 256U
-
 static volatile sig_atomic_t g_force_quit = 0;
 
 static void handle_signal(int signum) {
@@ -298,6 +300,10 @@ int main(int argc, char **argv) {
 
     if (max_vc_csv >= ctx.cfg.nb_vc) {
         rte_exit(EXIT_FAILURE, "CSV vc id exceeds configured --vcs\n");
+    }
+
+    if (ctx.cfg.packet_size < (RTE_ETHER_HDR_LEN + sizeof(struct rte_ipv4_hdr) + FC_HEADER_SIZE)) {
+        rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+IPv4+FC headers\n");
     }
 
     if (ctx.cfg.packet_size > RTE_MBUF_DEFAULT_BUF_SIZE - RTE_PKTMBUF_HEADROOM) {
