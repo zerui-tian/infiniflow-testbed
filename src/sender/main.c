@@ -229,7 +229,7 @@ static int producer_loop(void *arg) {
             break;
         }
 
-        usleep(ctx->cfg.tick_us);
+        //usleep(ctx->cfg.tick_us);
     }
 
     return 0;
