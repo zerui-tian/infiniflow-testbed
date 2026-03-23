@@ -2,3 +2,5 @@
 .vscode/
 build/
 .git/
+output/
+figures/
