@@ -217,6 +217,8 @@ static int init_vc_rings(sender_ctx_t *ctx) {
 static int producer_loop(void *arg) {
     sender_ctx_t *ctx = (sender_ctx_t *)arg;
 
+    /* Use producer thread start as scheduling time origin. */
+    ctx->start_cycles = rte_get_timer_cycles();
     while (!g_force_quit) {
         double now_sec = sender_now_sec(ctx);
 
@@ -331,7 +333,6 @@ int main(int argc, char **argv) {
     }
 
     ctx.hz = rte_get_timer_hz();
-    ctx.start_cycles = rte_get_timer_cycles();
 
     ctx.mbuf_pool =
         rte_pktmbuf_pool_create("sender_mbuf_pool", ctx.cfg.mempool_size, MBUF_CACHE_SIZE, 0,
