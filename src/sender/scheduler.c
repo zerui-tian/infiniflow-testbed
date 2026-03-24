@@ -19,7 +19,7 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
         struct rte_mbuf *mbuf = NULL;
         char *packet = NULL;
         struct rte_ether_hdr *eth_hdr = NULL;
-        fc_header_t *fc_hdr = NULL;
+        fc_data_header_t *fc_hdr = NULL;
         char *payload = NULL;
         uint32_t payload_len = 0;
         struct rte_ether_addr src_mac;
@@ -38,6 +38,16 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
             continue;
         }
 
+        if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
+            sender_vc_fc_state_t *fc_state = &ctx->vc_fc_states[flow->vc];
+            uint64_t fccl = __atomic_load_n(&fc_state->fccl, __ATOMIC_ACQUIRE);
+            uint64_t fctbs = __atomic_load_n(&fc_state->fctbs, __ATOMIC_RELAXED);
+
+            if (fccl <= fctbs) {
+                continue;
+            }
+        }
+
         q = &ctx->vc_queues[flow->vc];
         mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
         if (mbuf == NULL) {
@@ -51,7 +61,7 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
         }
 
         eth_hdr = (struct rte_ether_hdr *)packet;
-        fc_hdr = (fc_header_t *)(packet + sizeof(*eth_hdr));
+        fc_hdr = (fc_data_header_t *)(packet + sizeof(*eth_hdr));
         payload = (char *)(fc_hdr + 1);
 
         payload_len = ctx->cfg.packet_size - (uint32_t)sizeof(*eth_hdr) - (uint32_t)sizeof(*fc_hdr);
@@ -63,6 +73,7 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
         eth_hdr->ether_type = rte_cpu_to_be_16(FC_ETHER_TYPE);
 
         fc_hdr->flow_id = rte_cpu_to_be_32(flow->fid);
+        fc_hdr->vc_id = rte_cpu_to_be_32(flow->vc);
         memset(payload, 0, payload_len);
 
         if (rte_ring_sp_enqueue(q->ring, mbuf) != 0) {
@@ -71,6 +82,9 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
         }
 
         flow->sent_count++;
+        if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
+            __atomic_fetch_add(&ctx->vc_fc_states[flow->vc].fctbs, 1U, __ATOMIC_RELAXED);
+        }
         enqueued++;
         ctx->total_pkts_enqueued++;
 

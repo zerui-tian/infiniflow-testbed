@@ -23,7 +23,9 @@
 #define DEFAULT_PKT_SIZE 8000U
 #define DEFAULT_MEMPOOL_SIZE 32768U
 #define DEFAULT_TX_BURST 64U
+#define DEFAULT_RX_BURST 64U
 #define DEFAULT_TICK_US 1000U
+#define DEFAULT_INITIAL_FCCL 1024U
 #define MBUF_CACHE_SIZE 256U
 static volatile sig_atomic_t g_force_quit = 0;
 
@@ -64,6 +66,31 @@ static int parse_u32(const char *s, uint32_t *out) {
     return 0;
 }
 
+static int parse_u64(const char *s, uint64_t *out) {
+    unsigned long long v = 0;
+    char *end = NULL;
+
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return -1;
+    }
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int parse_fc_mode(const char *s, fc_mode_t *mode) {
+    if (strcmp(s, "none") == 0) {
+        *mode = FC_MODE_NONE;
+        return 0;
+    }
+    if (strcmp(s, "cbfc") == 0) {
+        *mode = FC_MODE_CBFC;
+        return 0;
+    }
+    return -1;
+}
+
 static void usage(const char *prog) {
     printf("Usage: %s [EAL args] -- --csv <path> [options]\n", prog);
     printf("Options:\n");
@@ -74,7 +101,10 @@ static void usage(const char *prog) {
     printf("  --pkt-size <bytes>   Packet size in bytes (default: 8000)\n");
     printf("  --mempool <num>      Mempool object count (default: 32768)\n");
     printf("  --tx-burst <num>     TX burst size (default: 64)\n");
+    printf("  --rx-burst <num>     RX burst size for feedback (default: 64)\n");
     printf("  --tick-us <num>      Producer tick interval us (default: 1000)\n");
+    printf("  --fc-mode <mode>     Flow control mode: none|cbfc (default: none)\n");
+    printf("  --initial-fccl <n>   Initial CBFC FCCL per VC (default: 1024)\n");
 }
 
 static int parse_app_args(int argc, char **argv, sender_config_t *cfg) {
@@ -86,13 +116,16 @@ static int parse_app_args(int argc, char **argv, sender_config_t *cfg) {
         {"pkt-size", required_argument, 0, 's'},
         {"mempool", required_argument, 0, 'm'},
         {"tx-burst", required_argument, 0, 'b'},
+        {"rx-burst", required_argument, 0, 'x'},
         {"tick-us", required_argument, 0, 't'},
+        {"fc-mode", required_argument, 0, 'f'},
+        {"initial-fccl", required_argument, 0, 'i'},
         {0, 0, 0, 0},
     };
 
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "c:p:v:r:s:m:b:t:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:p:v:r:s:m:b:x:t:f:i:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c':
                 cfg->csv_path = optarg;
@@ -132,24 +165,42 @@ static int parse_app_args(int argc, char **argv, sender_config_t *cfg) {
                     return -1;
                 }
                 break;
+            case 'x':
+                if (parse_u32(optarg, &cfg->rx_burst_size) != 0) {
+                    return -1;
+                }
+                break;
+            case 'f':
+                if (parse_fc_mode(optarg, &cfg->fc_mode) != 0) {
+                    return -1;
+                }
+                break;
+            case 'i':
+                if (parse_u64(optarg, &cfg->initial_fccl) != 0) {
+                    return -1;
+                }
+                break;
             default:
                 return -1;
         }
     }
 
     if (cfg->csv_path == NULL || cfg->nb_vc == 0U || cfg->ring_size == 0U || cfg->packet_size == 0U ||
-        cfg->tx_burst_size == 0U || cfg->tick_us == 0U) {
+        cfg->tx_burst_size == 0U || cfg->rx_burst_size == 0U || cfg->tick_us == 0U) {
         return -1;
     }
 
     return 0;
 }
 
-static int init_port(uint16_t port_id, uint32_t packet_size) {
+static int init_port(sender_ctx_t *ctx) {
+    const uint16_t port_id = ctx->cfg.port_id;
+    const uint32_t packet_size = ctx->cfg.packet_size;
     struct rte_eth_conf port_conf;
     struct rte_eth_dev_info dev_info;
-    const uint16_t nb_rx_queue = 0;
+    uint16_t nb_rxd = 1024;
     const uint16_t nb_tx_queue = 1;
+    const uint16_t nb_rx_queue = 1;
     uint16_t desired_mtu = 0;
     int rc = 0;
 
@@ -157,6 +208,12 @@ static int init_port(uint16_t port_id, uint32_t packet_size) {
     port_conf.txmode.mq_mode = RTE_ETH_MQ_TX_NONE;
 
     rc = rte_eth_dev_configure(port_id, nb_rx_queue, nb_tx_queue, &port_conf);
+    if (rc < 0) {
+        return rc;
+    }
+
+    rc = rte_eth_rx_queue_setup(port_id, ctx->cfg.rx_queue_id, nb_rxd, rte_eth_dev_socket_id(port_id),
+                                NULL, ctx->mbuf_pool);
     if (rc < 0) {
         return rc;
     }
@@ -178,7 +235,8 @@ static int init_port(uint16_t port_id, uint32_t packet_size) {
         }
     }
 
-    rc = rte_eth_tx_queue_setup(port_id, 0, 1024, rte_eth_dev_socket_id(port_id), NULL);
+    rc = rte_eth_tx_queue_setup(port_id, ctx->cfg.tx_queue_id, 1024, rte_eth_dev_socket_id(port_id),
+                                NULL);
     if (rc < 0) {
         return rc;
     }
@@ -211,6 +269,22 @@ static int init_vc_rings(sender_ctx_t *ctx) {
             return -1;
         }
     }
+    return 0;
+}
+
+static int init_vc_fc_states(sender_ctx_t *ctx) {
+    uint32_t i = 0;
+
+    ctx->vc_fc_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_fc_states));
+    if (ctx->vc_fc_states == NULL) {
+        return -1;
+    }
+
+    for (i = 0; i < ctx->cfg.nb_vc; i++) {
+        ctx->vc_fc_states[i].fccl = ctx->cfg.initial_fccl;
+        ctx->vc_fc_states[i].fctbs = 0U;
+    }
+
     return 0;
 }
 
@@ -251,6 +325,16 @@ static int forward_loop(void *arg) {
     return 0;
 }
 
+static int feedback_rx_loop(void *arg) {
+    sender_ctx_t *ctx = (sender_ctx_t *)arg;
+
+    while (!g_force_quit) {
+        sender_feedback_rx_run_tick(ctx);
+    }
+
+    return 0;
+}
+
 static void cleanup_sender(sender_ctx_t *ctx) {
     uint32_t i = 0;
 
@@ -271,6 +355,7 @@ static void cleanup_sender(sender_ctx_t *ctx) {
         rte_eth_dev_close(ctx->cfg.port_id);
     }
 
+    free(ctx->vc_fc_states);
     free(ctx->vc_queues);
     free(ctx->active_ids);
     free(ctx->pending_order);
@@ -284,18 +369,23 @@ int main(int argc, char **argv) {
     int eal_argc = 0;
     unsigned int producer_lcore = 0;
     unsigned int forward_lcore = 0;
+    unsigned int feedback_lcore = 0;
     unsigned int lcore_id = 0;
     int rc = 0;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.cfg.port_id = 0;
+    ctx.cfg.rx_queue_id = 0;
     ctx.cfg.tx_queue_id = 0;
     ctx.cfg.nb_vc = DEFAULT_NB_VC;
     ctx.cfg.ring_size = DEFAULT_RING_SIZE;
     ctx.cfg.packet_size = DEFAULT_PKT_SIZE;
     ctx.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
     ctx.cfg.tx_burst_size = DEFAULT_TX_BURST;
+    ctx.cfg.rx_burst_size = DEFAULT_RX_BURST;
     ctx.cfg.tick_us = DEFAULT_TICK_US;
+    ctx.cfg.initial_fccl = DEFAULT_INITIAL_FCCL;
+    ctx.cfg.fc_mode = FC_MODE_NONE;
 
     eal_argc = rte_eal_init(argc, argv);
     if (eal_argc < 0) {
@@ -323,7 +413,7 @@ int main(int argc, char **argv) {
         rte_exit(EXIT_FAILURE, "CSV vc id exceeds configured --vcs\n");
     }
 
-    if (ctx.cfg.packet_size < (RTE_ETHER_HDR_LEN + FC_HEADER_SIZE)) {
+    if (ctx.cfg.packet_size < (RTE_ETHER_HDR_LEN + FC_DATA_HEADER_SIZE)) {
         rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+FC headers\n");
     }
 
@@ -341,12 +431,16 @@ int main(int argc, char **argv) {
         rte_exit(EXIT_FAILURE, "mempool create failed\n");
     }
 
-    if (init_port(ctx.cfg.port_id, ctx.cfg.packet_size) != 0) {
+    if (init_port(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "port init failed\n");
     }
 
     if (init_vc_rings(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "ring init failed\n");
+    }
+
+    if (init_vc_fc_states(&ctx) != 0) {
+        rte_exit(EXIT_FAILURE, "vc flow-control state init failed\n");
     }
 
     if (activity_manager_init(&ctx) != 0) {
@@ -358,19 +452,23 @@ int main(int argc, char **argv) {
             producer_lcore = lcore_id;
         } else if (forward_lcore == 0U) {
             forward_lcore = lcore_id;
+        } else if (feedback_lcore == 0U) {
+            feedback_lcore = lcore_id;
             break;
         }
     }
 
-    if (producer_lcore == 0U || forward_lcore == 0U) {
-        rte_exit(EXIT_FAILURE, "Need at least 2 worker lcores for producer/forward\n");
+    if (producer_lcore == 0U || forward_lcore == 0U || feedback_lcore == 0U) {
+        rte_exit(EXIT_FAILURE, "Need at least 3 worker lcores for producer/forward/feedback-rx\n");
     }
 
     rte_eal_remote_launch(producer_loop, &ctx, producer_lcore);
     rte_eal_remote_launch(forward_loop, &ctx, forward_lcore);
+    rte_eal_remote_launch(feedback_rx_loop, &ctx, feedback_lcore);
 
     rte_eal_wait_lcore(producer_lcore);
     rte_eal_wait_lcore(forward_lcore);
+    rte_eal_wait_lcore(feedback_lcore);
 
     printf("Sender completed. enqueued=%" PRIu64 ", tx=%" PRIu64 "\n", ctx.total_pkts_enqueued,
            ctx.total_pkts_tx);

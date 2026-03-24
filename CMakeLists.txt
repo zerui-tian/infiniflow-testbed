@@ -11,6 +11,7 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(DPDK REQUIRED libdpdk)
 
 add_executable(sender
+    src/core/fc_mode.h
     src/core/fc_header.h
     src/core/flow.h
     src/core/vc_ring.h
@@ -20,6 +21,7 @@ add_executable(sender
     src/sender/activity_manager.c
     src/sender/scheduler.c
     src/sender/forward.c
+    src/sender/feedback_rx.c
 )
 
 target_include_directories(sender PRIVATE
@@ -38,6 +40,7 @@ target_link_directories(sender PRIVATE ${DPDK_LIBRARY_DIRS})
 target_link_libraries(sender PRIVATE ${DPDK_LIBRARIES})
 
 add_executable(receiver
+    src/core/fc_mode.h
     src/core/fc_header.h
     src/receiver/receiver_ctx.h
     src/receiver/main.c

@@ -18,6 +18,9 @@
 
 #define DEFAULT_MEMPOOL_SIZE 32768U
 #define DEFAULT_RX_BURST 64U
+#define DEFAULT_TX_BURST 64U
+#define DEFAULT_NB_VC 8U
+#define DEFAULT_CBFC_TOTAL_BUFFER_PKTS 8192U
 #define DEFAULT_PKT_SIZE 8000U
 #define DEFAULT_OUTPUT_PATH "receiver_flow_stats.csv"
 #define MBUF_CACHE_SIZE 256U
@@ -59,37 +62,81 @@ static int parse_u32(const char *s, uint32_t *out) {
     return 0;
 }
 
+static int parse_u64(const char *s, uint64_t *out) {
+    unsigned long long v = 0;
+    char *end = NULL;
+
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno != 0 || end == s || *end != '\0') {
+        return -1;
+    }
+
+    *out = (uint64_t)v;
+    return 0;
+}
+
+static int parse_fc_mode(const char *s, fc_mode_t *mode) {
+    if (strcmp(s, "none") == 0) {
+        *mode = FC_MODE_NONE;
+        return 0;
+    }
+    if (strcmp(s, "cbfc") == 0) {
+        *mode = FC_MODE_CBFC;
+        return 0;
+    }
+    return -1;
+}
+
 static void usage(const char *prog) {
     printf("Usage: %s [EAL args] -- [options]\n", prog);
     printf("Options:\n");
     printf("  --port <id>          NIC port id (default: 0)\n");
+    printf("  --vcs <num>          Number of virtual channels (default: 8)\n");
     printf("  --rx-burst <num>     RX burst size (default: 64)\n");
+    printf("  --tx-burst <num>     TX burst size for feedback (default: 64)\n");
     printf("  --pkt-size <bytes>   Expected packet size in bytes (default: 8000)\n");
     printf("  --mempool <num>      Mempool object count (default: 32768)\n");
+    printf("  --fc-mode <mode>     Flow control mode: none|cbfc (default: none)\n");
+    printf("  --cbfc-buffer-pkts <num>  Total CBFC buffer packets shared by all VCs (default: 8192)\n");
     printf("  --output <path>      Output CSV file path (default: receiver_flow_stats.csv)\n");
 }
 
 static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
     static const struct option long_opts[] = {
         {"port", required_argument, 0, 'p'},
+        {"vcs", required_argument, 0, 'v'},
         {"rx-burst", required_argument, 0, 'b'},
+        {"tx-burst", required_argument, 0, 't'},
         {"pkt-size", required_argument, 0, 's'},
         {"mempool", required_argument, 0, 'm'},
+        {"fc-mode", required_argument, 0, 'f'},
+        {"cbfc-buffer-pkts", required_argument, 0, 'c'},
         {"output", required_argument, 0, 'o'},
         {0, 0, 0, 0},
     };
 
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:b:s:m:o:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:v:b:t:s:m:f:c:o:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 if (parse_u16(optarg, &cfg->port_id) != 0) {
                     return -1;
                 }
                 break;
+            case 'v':
+                if (parse_u32(optarg, &cfg->nb_vc) != 0) {
+                    return -1;
+                }
+                break;
             case 'b':
                 if (parse_u32(optarg, &cfg->rx_burst_size) != 0) {
+                    return -1;
+                }
+                break;
+            case 't':
+                if (parse_u32(optarg, &cfg->tx_burst_size) != 0) {
                     return -1;
                 }
                 break;
@@ -103,6 +150,16 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
                     return -1;
                 }
                 break;
+            case 'f':
+                if (parse_fc_mode(optarg, &cfg->fc_mode) != 0) {
+                    return -1;
+                }
+                break;
+            case 'c':
+                if (parse_u64(optarg, &cfg->cbfc_total_buffer_pkts) != 0) {
+                    return -1;
+                }
+                break;
             case 'o':
                 cfg->output_path = optarg;
                 break;
@@ -111,7 +168,8 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
         }
     }
 
-    if (cfg->rx_burst_size == 0U || cfg->packet_size == 0U || cfg->mempool_size == 0U ||
+    if (cfg->nb_vc == 0U || cfg->rx_burst_size == 0U || cfg->tx_burst_size == 0U ||
+        cfg->packet_size == 0U || cfg->mempool_size == 0U ||
         cfg->output_path == NULL) {
         return -1;
     }
@@ -123,18 +181,25 @@ static int init_port(receiver_ctx_t *ctx) {
     struct rte_eth_conf port_conf;
     struct rte_eth_dev_info dev_info;
     uint16_t nb_rxd = 1024;
+    uint16_t nb_txd = 1024;
     uint16_t desired_mtu = 0;
     int rc = 0;
 
     memset(&port_conf, 0, sizeof(port_conf));
 
-    rc = rte_eth_dev_configure(ctx->cfg.port_id, 1, 0, &port_conf);
+    rc = rte_eth_dev_configure(ctx->cfg.port_id, 1, 1, &port_conf);
     if (rc < 0) {
         return rc;
     }
 
     rc = rte_eth_rx_queue_setup(ctx->cfg.port_id, ctx->cfg.rx_queue_id, nb_rxd,
                                 rte_eth_dev_socket_id(ctx->cfg.port_id), NULL, ctx->mbuf_pool);
+    if (rc < 0) {
+        return rc;
+    }
+
+    rc = rte_eth_tx_queue_setup(ctx->cfg.port_id, ctx->cfg.tx_queue_id, nb_txd,
+                                rte_eth_dev_socket_id(ctx->cfg.port_id), NULL);
     if (rc < 0) {
         return rc;
     }
@@ -162,6 +227,65 @@ static int init_port(receiver_ctx_t *ctx) {
     }
 
     return 0;
+}
+
+static int init_vc_cbfc_states(receiver_ctx_t *ctx) {
+    uint32_t i = 0;
+    uint64_t base = 0;
+    uint64_t rem = 0;
+
+    if (ctx->cfg.fc_mode != FC_MODE_CBFC) {
+        return 0;
+    }
+
+    ctx->vc_cbfc_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_cbfc_states));
+    if (ctx->vc_cbfc_states == NULL) {
+        return -1;
+    }
+
+    base = ctx->cfg.cbfc_total_buffer_pkts / (uint64_t)ctx->cfg.nb_vc;
+    rem = ctx->cfg.cbfc_total_buffer_pkts % (uint64_t)ctx->cfg.nb_vc;
+    for (i = 0; i < ctx->cfg.nb_vc; i++) {
+        ctx->vc_cbfc_states[i].buffer_cap = base + ((uint64_t)i < rem ? 1U : 0U);
+        ctx->vc_cbfc_states[i].received = 0U;
+    }
+
+    return 0;
+}
+
+static void send_cbfc_feedback(receiver_ctx_t *ctx, const struct rte_ether_addr *dst_addr,
+                               uint32_t vc_id, uint64_t fccl) {
+    struct rte_mbuf *mbuf = NULL;
+    char *packet = NULL;
+    struct rte_ether_hdr *eth_hdr = NULL;
+    cbfc_feedback_header_t *fb_hdr = NULL;
+    struct rte_ether_addr src_mac;
+
+    mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
+    if (mbuf == NULL) {
+        return;
+    }
+
+    packet = rte_pktmbuf_append(mbuf, sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE);
+    if (packet == NULL) {
+        rte_pktmbuf_free(mbuf);
+        return;
+    }
+
+    eth_hdr = (struct rte_ether_hdr *)packet;
+    fb_hdr = (cbfc_feedback_header_t *)(packet + sizeof(*eth_hdr));
+
+    rte_eth_macaddr_get(ctx->cfg.port_id, &src_mac);
+    rte_ether_addr_copy(dst_addr, &eth_hdr->dst_addr);
+    rte_ether_addr_copy(&src_mac, &eth_hdr->src_addr);
+    eth_hdr->ether_type = rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE);
+
+    fb_hdr->vc_id = rte_cpu_to_be_32(vc_id);
+    fb_hdr->fccl = fc_cpu_to_be64(fccl);
+
+    if (rte_eth_tx_burst(ctx->cfg.port_id, ctx->cfg.tx_queue_id, &mbuf, 1) != 1U) {
+        rte_pktmbuf_free(mbuf);
+    }
 }
 
 static uint32_t flow_hash(uint32_t flow_id) {
@@ -264,10 +388,12 @@ static int update_flow_stats(receiver_ctx_t *ctx, uint32_t flow_id, uint64_t ts_
 
 static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     const struct rte_ether_hdr *eth_hdr = NULL;
-    const fc_header_t *fc_hdr = NULL;
+    const fc_data_header_t *fc_hdr = NULL;
     uint32_t min_len = 0;
     uint32_t flow_id = 0;
+    uint32_t vc_id = 0;
     uint64_t ts_cycles = 0;
+    int rc = 0;
 
     if (mbuf->pkt_len < sizeof(struct rte_ether_hdr)) {
         return 0;
@@ -278,16 +404,35 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
         return 0;
     }
 
-    min_len = sizeof(struct rte_ether_hdr) + sizeof(fc_header_t);
+    min_len = sizeof(struct rte_ether_hdr) + FC_DATA_HEADER_SIZE;
     if (mbuf->pkt_len < min_len) {
         return 0;
     }
 
-    fc_hdr = (const fc_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
+    fc_hdr = (const fc_data_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
     flow_id = rte_be_to_cpu_32(fc_hdr->flow_id);
+    vc_id = rte_be_to_cpu_32(fc_hdr->vc_id);
     ts_cycles = rte_get_timer_cycles();
 
-    return update_flow_stats(ctx, flow_id, ts_cycles, mbuf->pkt_len);
+    rc = update_flow_stats(ctx, flow_id, ts_cycles, mbuf->pkt_len);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
+        receiver_vc_cbfc_state_t *vc_state = NULL;
+        uint64_t fccl = 0;
+
+        if (vc_id >= ctx->cfg.nb_vc) {
+            return 0;
+        }
+        vc_state = &ctx->vc_cbfc_states[vc_id];
+        vc_state->received++;
+        fccl = vc_state->buffer_cap + vc_state->received;
+        send_cbfc_feedback(ctx, &eth_hdr->src_addr, vc_id, fccl);
+    }
+
+    return 0;
 }
 
 static int flush_flow_stats_to_csv(const receiver_ctx_t *ctx, uint64_t end_cycles) {
@@ -362,6 +507,8 @@ static void cleanup_receiver(receiver_ctx_t *ctx) {
         }
         free(ctx->records);
     }
+
+    free(ctx->vc_cbfc_states);
 }
 
 int main(int argc, char **argv) {
@@ -375,9 +522,14 @@ int main(int argc, char **argv) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.cfg.port_id = 0;
     ctx.cfg.rx_queue_id = 0;
+    ctx.cfg.tx_queue_id = 0;
+    ctx.cfg.nb_vc = DEFAULT_NB_VC;
     ctx.cfg.rx_burst_size = DEFAULT_RX_BURST;
+    ctx.cfg.tx_burst_size = DEFAULT_TX_BURST;
     ctx.cfg.packet_size = DEFAULT_PKT_SIZE;
     ctx.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
+    ctx.cfg.cbfc_total_buffer_pkts = DEFAULT_CBFC_TOTAL_BUFFER_PKTS;
+    ctx.cfg.fc_mode = FC_MODE_NONE;
     ctx.cfg.output_path = DEFAULT_OUTPUT_PATH;
 
     eal_argc = rte_eal_init(argc, argv);
@@ -418,6 +570,10 @@ int main(int argc, char **argv) {
 
     if (flow_table_init(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "flow table init failed\n");
+    }
+
+    if (init_vc_cbfc_states(&ctx) != 0) {
+        rte_exit(EXIT_FAILURE, "vc cbfc state init failed\n");
     }
 
     burst = (uint16_t)ctx.cfg.rx_burst_size;

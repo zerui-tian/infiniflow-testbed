@@ -8,19 +8,29 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 
+#include "core/fc_mode.h"
 #include "core/flow.h"
 #include "core/vc_ring.h"
+
+typedef struct sender_vc_fc_state_s {
+    uint64_t fccl;
+    uint64_t fctbs;
+} sender_vc_fc_state_t;
 
 typedef struct sender_config_s {
     const char *csv_path;
     uint16_t port_id;
+    uint16_t rx_queue_id;
     uint16_t tx_queue_id;
     uint32_t nb_vc;
     uint32_t ring_size;
     uint32_t packet_size;
     uint32_t mempool_size;
     uint32_t tx_burst_size;
+    uint32_t rx_burst_size;
     uint32_t tick_us;
+    uint64_t initial_fccl;
+    fc_mode_t fc_mode;
 } sender_config_t;
 
 typedef struct sender_ctx_s {
@@ -36,6 +46,7 @@ typedef struct sender_ctx_s {
     uint32_t nb_active;
 
     vc_queue_t *vc_queues;
+    sender_vc_fc_state_t *vc_fc_states;
 
     struct rte_mempool *mbuf_pool;
 
@@ -56,6 +67,7 @@ bool activity_manager_all_done(const sender_ctx_t *ctx);
 
 int scheduler_run_tick(sender_ctx_t *ctx);
 uint32_t forward_run_tick(sender_ctx_t *ctx);
+uint32_t sender_feedback_rx_run_tick(sender_ctx_t *ctx);
 
 double sender_now_sec(const sender_ctx_t *ctx);
 

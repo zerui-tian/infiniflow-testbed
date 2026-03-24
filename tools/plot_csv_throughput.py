@@ -29,6 +29,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+FIXED_PACKET_SIZE_BYTES = 1500
+
 
 def _ensure_csv_field_limit() -> None:
     """Allow very large CSV fields (e.g. millions of timestamps in one cell).
@@ -50,7 +52,7 @@ def parse_timestamps(field: str) -> list[float]:
 
 
 def binned_throughput_bps(
-    times: list[float], row_bps: float, row_pps: float, n_bins: int
+    times: list[float], row_pps: float, n_bins: int
 ) -> tuple[list[float], list[float]]:
     """Bin centers (s) and throughput (bit/s) per bin."""
     if not times:
@@ -58,7 +60,8 @@ def binned_throughput_bps(
     times = sorted(times)
     t0, t1 = times[0], times[-1]
     span = t1 - t0
-    bpp = (row_bps / row_pps) if row_pps > 0 else 0.0
+    # Use a fixed packet size for throughput conversion.
+    bpp = float(FIXED_PACKET_SIZE_BYTES * 8) if row_pps > 0 else 0.0
 
     if span <= 0:
         width = 1e-6
@@ -95,7 +98,6 @@ def load_series(
             try:
                 fid = int(row["flow_id"])
                 pps = float(row["pps"])
-                bps = float(row["bps"])
             except (KeyError, ValueError) as e:
                 raise ValueError(f"bad row {row!r}: {e}") from e
             ts = parse_timestamps(row.get("timestamps_sec", ""))
@@ -103,7 +105,7 @@ def load_series(
                 continue
             t_join = min(ts)
             t_leave = max(ts)
-            centers, tbps = binned_throughput_bps(ts, bps, pps, n_bins)
+            centers, tbps = binned_throughput_bps(ts, pps, n_bins)
             if not centers:
                 continue
             gbps = [v / 1e9 for v in tbps]
@@ -175,7 +177,7 @@ def main() -> int:
     parser.add_argument(
         "--bins",
         type=int,
-        default=100,
+        default=10000,
         help="Number of time bins per flow (default: 100)",
     )
     parser.add_argument(
