@@ -13,6 +13,7 @@
 #include <rte_eal.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_log.h>
 #include <rte_mbuf.h>
 #include <rte_cycles.h>
 
@@ -32,6 +33,14 @@ static volatile sig_atomic_t g_force_quit = 0;
 static void handle_signal(int signum) {
     (void)signum;
     g_force_quit = 1;
+}
+
+static void sync_user1_log_level_with_global(void) {
+    uint32_t level = rte_log_get_global_level();
+
+    if (rte_log_set_level(RTE_LOGTYPE_USER1, level) < 0) {
+        fprintf(stderr, "failed to sync USER1 log level to global level=%" PRIu32 "\n", level);
+    }
 }
 
 static int parse_u16(const char *s, uint16_t *out) {
@@ -422,13 +431,22 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
         receiver_vc_cbfc_state_t *vc_state = NULL;
         uint64_t fccl = 0;
+        uint64_t old_received = 0;
+        uint64_t new_received = 0;
 
         if (vc_id >= ctx->cfg.nb_vc) {
             return 0;
         }
         vc_state = &ctx->vc_cbfc_states[vc_id];
-        vc_state->received++;
+        old_received = vc_state->received;
+        vc_state->received = old_received + 1U;
+        new_received = vc_state->received;
         fccl = vc_state->buffer_cap + vc_state->received;
+        RTE_LOG(DEBUG, USER1,
+                "[CBFC][receiver][rx] vc=%" PRIu32 " flow=%" PRIu32
+                " buffer_cap=%" PRIu64 " old_received=%" PRIu64
+                " new_received=%" PRIu64 " fccl=%" PRIu64 "\n",
+                vc_id, flow_id, vc_state->buffer_cap, old_received, new_received, fccl);
         send_cbfc_feedback(ctx, &eth_hdr->src_addr, vc_id, fccl);
     }
 
@@ -536,6 +554,7 @@ int main(int argc, char **argv) {
     if (eal_argc < 0) {
         rte_exit(EXIT_FAILURE, "EAL init failed\n");
     }
+    sync_user1_log_level_with_global();
 
     argc -= eal_argc;
     argv += eal_argc;

@@ -1,9 +1,12 @@
 #include "sender/sender_ctx.h"
 #include "core/fc_header.h"
 
+#include <inttypes.h>
+
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_log.h>
 #include <rte_mbuf.h>
 
 uint32_t sender_feedback_rx_run_tick(sender_ctx_t *ctx) {
@@ -45,6 +48,19 @@ uint32_t sender_feedback_rx_run_tick(sender_ctx_t *ctx) {
         }
 
         fccl = fc_be64_to_cpu(fb_hdr->fccl);
+        {
+            sender_vc_fc_state_t *vc_state = &ctx->vc_fc_states[vc_id];
+            uint64_t old_fccl = __atomic_load_n(&vc_state->fccl, __ATOMIC_RELAXED);
+            uint64_t fctbs = __atomic_load_n(&vc_state->fctbs, __ATOMIC_RELAXED);
+            uint64_t old_credit = (old_fccl > fctbs) ? (old_fccl - fctbs) : 0U;
+            uint64_t new_credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
+
+            RTE_LOG(DEBUG, USER1,
+                    "[CBFC][sender][feedback] vc=%" PRIu32
+                    " old_fccl=%" PRIu64 " new_fccl=%" PRIu64
+                    " fctbs=%" PRIu64 " old_credit=%" PRIu64 " new_credit=%" PRIu64 "\n",
+                    vc_id, old_fccl, fccl, fctbs, old_credit, new_credit);
+        }
         __atomic_store_n(&ctx->vc_fc_states[vc_id].fccl, fccl, __ATOMIC_RELEASE);
         processed++;
     }

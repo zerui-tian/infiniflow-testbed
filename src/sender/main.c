@@ -15,6 +15,7 @@
 #include <rte_ether.h>
 #include <rte_ethdev.h>
 #include <rte_lcore.h>
+#include <rte_log.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
@@ -32,6 +33,14 @@ static volatile sig_atomic_t g_force_quit = 0;
 static void handle_signal(int signum) {
     (void)signum;
     g_force_quit = 1;
+}
+
+static void sync_user1_log_level_with_global(void) {
+    uint32_t level = rte_log_get_global_level();
+
+    if (rte_log_set_level(RTE_LOGTYPE_USER1, level) < 0) {
+        fprintf(stderr, "failed to sync USER1 log level to global level=%" PRIu32 "\n", level);
+    }
 }
 
 double sender_now_sec(const sender_ctx_t *ctx) {
@@ -391,6 +400,7 @@ int main(int argc, char **argv) {
     if (eal_argc < 0) {
         rte_exit(EXIT_FAILURE, "EAL init failed\n");
     }
+    sync_user1_log_level_with_global();
 
     argc -= eal_argc;
     argv += eal_argc;
@@ -417,7 +427,8 @@ int main(int argc, char **argv) {
         rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+FC headers\n");
     }
 
-    data_room_size = ctx.cfg.packet_size + RTE_PKTMBUF_HEADROOM;
+    /* RX queue setup needs mbuf room for full L2 frame even when pkt-size is MTU-like (e.g. 1500). */
+    data_room_size = RTE_MAX(ctx.cfg.packet_size, (uint32_t)RTE_ETHER_MAX_LEN) + RTE_PKTMBUF_HEADROOM;
     if (data_room_size > UINT16_MAX) {
         rte_exit(EXIT_FAILURE, "Packet size too large for mbuf data room\n");
     }
