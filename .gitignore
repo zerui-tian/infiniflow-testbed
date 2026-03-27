@@ -1,0 +1,6 @@
+.cursor/
+.vscode/
+build/
+.git/
+output/
+figures/
