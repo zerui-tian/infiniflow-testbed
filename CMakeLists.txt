@@ -60,3 +60,30 @@ target_compile_options(receiver PRIVATE
 
 target_link_directories(receiver PRIVATE ${DPDK_LIBRARY_DIRS})
 target_link_libraries(receiver PRIVATE ${DPDK_LIBRARIES})
+
+add_executable(switch
+    src/core/fc_mode.h
+    src/core/fc_header.h
+    src/core/vc_ring.h
+    src/switch/switch_ctx.h
+    src/switch/main.c
+    src/switch/scheduler.c
+    src/switch/forward.c
+    src/switch/feedback_gen.c
+    src/switch/feedback_handler.c
+)
+
+target_include_directories(switch PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${DPDK_INCLUDE_DIRS}
+)
+
+target_compile_options(switch PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    ${DPDK_CFLAGS_OTHER}
+)
+
+target_link_directories(switch PRIVATE ${DPDK_LIBRARY_DIRS})
+target_link_libraries(switch PRIVATE ${DPDK_LIBRARIES})
