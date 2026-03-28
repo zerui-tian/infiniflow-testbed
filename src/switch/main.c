@@ -411,7 +411,7 @@ uint16_t switch_flow_map_lookup(const switch_ctx_t *ctx, uint32_t flow_id) {
     switch (flow_id) {
         case 0U:
         case 1U:
-            return 1U;
+            return 0U;
         default:
             return UINT16_MAX;
     }
