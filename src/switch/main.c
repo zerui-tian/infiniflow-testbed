@@ -614,12 +614,15 @@ int main(int argc, char **argv) {
         if (rc != 0) {
             rte_exit(EXIT_FAILURE, "ingress port init failed\n");
         }
+        RTE_LOG(INFO, USER1, "switch: ingress port %" PRIu16 " started\n",
+                ctx.cfg.ingress_ports[ingress_idx]);
     }
     rc = init_port(ctx.cfg.egress_port, ctx.cfg.egress_rx_queue_id, ctx.cfg.egress_tx_queue_id,
                    ctx.mbuf_pool, ctx.cfg.packet_size);
     if (rc != 0) {
         rte_exit(EXIT_FAILURE, "egress port init failed\n");
     }
+    RTE_LOG(INFO, USER1, "switch: egress port %" PRIu16 " started\n", ctx.cfg.egress_port);
 
     if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "switch queue/state init failed\n");
