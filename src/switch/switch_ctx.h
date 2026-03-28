@@ -27,12 +27,6 @@ typedef struct switch_feedback_msg_s {
     struct rte_ether_addr dst_addr;
 } switch_feedback_msg_t;
 
-typedef struct switch_flow_map_entry_s {
-    bool used;
-    uint32_t flow_id;
-    uint16_t egress_port;
-} switch_flow_map_entry_t;
-
 struct switch_ctx_s;
 typedef struct switch_fc_ops_s {
     uint64_t (*calc_credit)(const struct switch_ctx_s *ctx, uint32_t vc_id);
@@ -58,9 +52,6 @@ typedef struct switch_config_s {
     uint64_t initial_fccl;
     uint64_t vc_capacity_pkts;
     fc_mode_t fc_mode;
-    uint32_t flow_map_capacity;
-    uint16_t default_egress_port;
-    const char *flow_map_spec;
 } switch_config_t;
 
 typedef struct switch_ctx_s {
@@ -71,9 +62,6 @@ typedef struct switch_ctx_s {
     struct rte_ring **feedback_free_queues;
     switch_vc_fc_state_t *vc_states;
     switch_feedback_msg_t *feedback_pool;
-
-    switch_flow_map_entry_t *flow_map_entries;
-    uint32_t flow_map_mask;
 
     struct rte_mempool *mbuf_pool;
 
@@ -93,9 +81,6 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx);
 uint32_t switch_feedback_gen_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);
 uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx);
 
-int switch_flow_map_init(switch_ctx_t *ctx);
-void switch_flow_map_free(switch_ctx_t *ctx);
-int switch_flow_map_insert(switch_ctx_t *ctx, uint32_t flow_id, uint16_t egress_port);
 uint16_t switch_flow_map_lookup(const switch_ctx_t *ctx, uint32_t flow_id);
 
 void switch_cbfc_ops_init(switch_ctx_t *ctx);

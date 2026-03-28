@@ -33,7 +33,7 @@ static void enqueue_feedback_msg(switch_ctx_t *ctx, uint16_t ingress_idx, uint32
     msg->fccl = fccl;
     rte_ether_addr_copy(dst_addr, &msg->dst_addr);
     if (rte_ring_sp_enqueue(ctx->feedback_queues[ingress_idx], msg) != 0) {
-        rte_ring_sp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
+        rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
         return;
     }
     ctx->total_feedback_generated++;

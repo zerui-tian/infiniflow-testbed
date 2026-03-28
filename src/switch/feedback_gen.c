@@ -35,14 +35,14 @@ uint32_t switch_feedback_gen_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
 
         mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
         if (mbuf == NULL) {
-            rte_ring_sp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
+            rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
             break;
         }
 
         packet = rte_pktmbuf_append(mbuf, sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE);
         if (packet == NULL) {
             rte_pktmbuf_free(mbuf);
-            rte_ring_sp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
+            rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
             continue;
         }
 
@@ -55,7 +55,7 @@ uint32_t switch_feedback_gen_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
         fb_hdr->fccl = fc_cpu_to_be64(msg->fccl);
         tx_pkts[prepared] = mbuf;
 
-        rte_ring_sp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
+        rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
     }
 
     if (prepared == 0U) {

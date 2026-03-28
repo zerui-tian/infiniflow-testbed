@@ -9,7 +9,7 @@ set -euo pipefail
 # 可通过修改下方默认参数或导出同名环境变量覆盖。
 #
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 SENDER_BIN="${BUILD_DIR}/sender"
 
@@ -17,7 +17,7 @@ SENDER_BIN="${BUILD_DIR}/sender"
 DEFAULT_EAL_LCORES="1-4"
 DEFAULT_EAL_MEM_CHANNELS="4"
 DEFAULT_EAL_PCI_ADDR="0000:01:00.0"
-DEFAULT_LOG_LEVEL="DEBUG"
+DEFAULT_LOG_LEVEL="INFO"
 DEFAULT_CSV_FILE="${ROOT_DIR}/examples/cbfc_test.csv"
 # DEFAULT_CSV_FILE="${ROOT_DIR}/examples/flows_sgh.csv"
 DEFAULT_PORT_ID="0"
