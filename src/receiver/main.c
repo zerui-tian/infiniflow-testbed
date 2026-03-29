@@ -10,12 +10,13 @@
 #include <string.h>
 
 #include <rte_byteorder.h>
+#include <rte_cycles.h>
 #include <rte_eal.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_mbuf.h>
-#include <rte_cycles.h>
 
 #define DEFAULT_MEMPOOL_SIZE 32768U
 #define DEFAULT_RX_BURST 64U
@@ -24,6 +25,7 @@
 #define DEFAULT_CBFC_TOTAL_BUFFER_PKTS 8192U
 #define DEFAULT_PKT_SIZE 8000U
 #define DEFAULT_OUTPUT_PATH "receiver_flow_stats.csv"
+#define DEFAULT_FEEDBACK_RING_SIZE 1024U
 #define MBUF_CACHE_SIZE 256U
 #define FLOW_TABLE_INIT_CAP 1024U
 #define MAX_RX_BURST 256U
@@ -108,6 +110,7 @@ static void usage(const char *prog) {
     printf("  --mempool <num>      Mempool object count (default: 32768)\n");
     printf("  --fc-mode <mode>     Flow control mode: none|cbfc (default: none)\n");
     printf("  --cbfc-buffer-pkts <num>  Total CBFC buffer packets shared by all VCs (default: 8192)\n");
+    printf("  --feedback-ring-size <num>  CBFC feedback ring depth (default: 1024)\n");
     printf("  --output <path>      Output CSV file path (default: receiver_flow_stats.csv)\n");
 }
 
@@ -121,13 +124,14 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
         {"mempool", required_argument, 0, 'm'},
         {"fc-mode", required_argument, 0, 'f'},
         {"cbfc-buffer-pkts", required_argument, 0, 'c'},
+        {"feedback-ring-size", required_argument, 0, 'q'},
         {"output", required_argument, 0, 'o'},
         {0, 0, 0, 0},
     };
 
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:v:b:t:s:m:f:c:o:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:v:b:t:s:m:f:c:q:o:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'p':
                 if (parse_u16(optarg, &cfg->port_id) != 0) {
@@ -169,6 +173,11 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
                     return -1;
                 }
                 break;
+            case 'q':
+                if (parse_u32(optarg, &cfg->feedback_ring_size) != 0) {
+                    return -1;
+                }
+                break;
             case 'o':
                 cfg->output_path = optarg;
                 break;
@@ -178,7 +187,7 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
     }
 
     if (cfg->nb_vc == 0U || cfg->rx_burst_size == 0U || cfg->tx_burst_size == 0U ||
-        cfg->packet_size == 0U || cfg->mempool_size == 0U ||
+        cfg->packet_size == 0U || cfg->mempool_size == 0U || cfg->feedback_ring_size == 0U ||
         cfg->output_path == NULL) {
         return -1;
     }
@@ -260,41 +269,6 @@ static int init_vc_cbfc_states(receiver_ctx_t *ctx) {
     }
 
     return 0;
-}
-
-static void send_cbfc_feedback(receiver_ctx_t *ctx, const struct rte_ether_addr *dst_addr,
-                               uint32_t vc_id, uint64_t fccl) {
-    struct rte_mbuf *mbuf = NULL;
-    char *packet = NULL;
-    struct rte_ether_hdr *eth_hdr = NULL;
-    cbfc_feedback_header_t *fb_hdr = NULL;
-    struct rte_ether_addr src_mac;
-
-    mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
-    if (mbuf == NULL) {
-        return;
-    }
-
-    packet = rte_pktmbuf_append(mbuf, sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE);
-    if (packet == NULL) {
-        rte_pktmbuf_free(mbuf);
-        return;
-    }
-
-    eth_hdr = (struct rte_ether_hdr *)packet;
-    fb_hdr = (cbfc_feedback_header_t *)(packet + sizeof(*eth_hdr));
-
-    rte_eth_macaddr_get(ctx->cfg.port_id, &src_mac);
-    rte_ether_addr_copy(dst_addr, &eth_hdr->dst_addr);
-    rte_ether_addr_copy(&src_mac, &eth_hdr->src_addr);
-    eth_hdr->ether_type = rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE);
-
-    fb_hdr->vc_id = rte_cpu_to_be_32(vc_id);
-    fb_hdr->fccl = fc_cpu_to_be64(fccl);
-
-    if (rte_eth_tx_burst(ctx->cfg.port_id, ctx->cfg.tx_queue_id, &mbuf, 1) != 1U) {
-        rte_pktmbuf_free(mbuf);
-    }
 }
 
 static uint32_t flow_hash(uint32_t flow_id) {
@@ -427,6 +401,7 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     if (rc != 0) {
         return rc;
     }
+    ctx->rx_fc_data_pkts++;
 
     if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
         receiver_vc_cbfc_state_t *vc_state = NULL;
@@ -447,7 +422,7 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
                 " buffer_cap=%" PRIu64 " old_received=%" PRIu64
                 " new_received=%" PRIu64 " fccl=%" PRIu64 "\n",
                 vc_id, flow_id, vc_state->buffer_cap, old_received, new_received, fccl);
-        send_cbfc_feedback(ctx, &eth_hdr->src_addr, vc_id, fccl);
+        receiver_feedback_try_enqueue(ctx, &eth_hdr->src_addr, vc_id, fccl);
     }
 
     return 0;
@@ -511,8 +486,46 @@ static int flush_flow_stats_to_csv(const receiver_ctx_t *ctx, uint64_t end_cycle
     return 0;
 }
 
+static int receiver_feedback_loop(void *arg) {
+    receiver_ctx_t *ctx = (receiver_ctx_t *)arg;
+
+    while (!g_force_quit) {
+        receiver_feedback_tx_run_tick(ctx);
+    }
+    while (receiver_feedback_tx_run_tick(ctx) > 0U) {
+    }
+
+    return 0;
+}
+
+static void receiver_run_rx_loop(receiver_ctx_t *ctx, uint16_t burst) {
+    struct rte_mbuf *rx_pkts[MAX_RX_BURST];
+
+    while (!g_force_quit) {
+        uint16_t nb_rx = rte_eth_rx_burst(ctx->cfg.port_id, ctx->cfg.rx_queue_id, rx_pkts, burst);
+        uint16_t i = 0;
+
+        if (nb_rx == 0U) {
+            continue;
+        }
+
+        for (i = 0; i < nb_rx; i++) {
+            if (process_one_packet(ctx, rx_pkts[i]) != 0) {
+                g_force_quit = 1;
+                break;
+            }
+        }
+
+        for (i = 0; i < nb_rx; i++) {
+            rte_pktmbuf_free(rx_pkts[i]);
+        }
+    }
+}
+
 static void cleanup_receiver(receiver_ctx_t *ctx) {
     uint32_t i = 0;
+
+    receiver_feedback_cleanup(ctx);
 
     if (rte_eth_dev_is_valid_port(ctx->cfg.port_id)) {
         rte_eth_dev_stop(ctx->cfg.port_id);
@@ -531,11 +544,12 @@ static void cleanup_receiver(receiver_ctx_t *ctx) {
 
 int main(int argc, char **argv) {
     receiver_ctx_t ctx;
-    struct rte_mbuf *rx_pkts[MAX_RX_BURST];
     uint32_t data_room_size = 0;
     uint16_t burst = 0;
     int eal_argc = 0;
     int rc = 0;
+    unsigned int feedback_lcore = 0;
+    unsigned int lcore_id = 0;
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.cfg.port_id = 0;
@@ -546,6 +560,7 @@ int main(int argc, char **argv) {
     ctx.cfg.tx_burst_size = DEFAULT_TX_BURST;
     ctx.cfg.packet_size = DEFAULT_PKT_SIZE;
     ctx.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
+    ctx.cfg.feedback_ring_size = DEFAULT_FEEDBACK_RING_SIZE;
     ctx.cfg.cbfc_total_buffer_pkts = DEFAULT_CBFC_TOTAL_BUFFER_PKTS;
     ctx.cfg.fc_mode = FC_MODE_NONE;
     ctx.cfg.output_path = DEFAULT_OUTPUT_PATH;
@@ -595,35 +610,42 @@ int main(int argc, char **argv) {
         rte_exit(EXIT_FAILURE, "vc cbfc state init failed\n");
     }
 
+    if (ctx.cfg.fc_mode == FC_MODE_CBFC) {
+        if (receiver_feedback_init(&ctx) != 0) {
+            rte_exit(EXIT_FAILURE, "receiver feedback ring init failed\n");
+        }
+    }
+
     burst = (uint16_t)ctx.cfg.rx_burst_size;
     if (burst > MAX_RX_BURST) {
         burst = MAX_RX_BURST;
     }
 
-    while (!g_force_quit) {
-        uint16_t nb_rx = rte_eth_rx_burst(ctx.cfg.port_id, ctx.cfg.rx_queue_id, rx_pkts, burst);
-        uint16_t i = 0;
-
-        if (nb_rx == 0U) {
-            continue;
+    if (ctx.cfg.fc_mode == FC_MODE_CBFC) {
+        RTE_LCORE_FOREACH_WORKER(lcore_id) {
+            feedback_lcore = lcore_id;
+            break;
         }
-
-        for (i = 0; i < nb_rx; i++) {
-            if (process_one_packet(&ctx, rx_pkts[i]) != 0) {
-                g_force_quit = 1;
-                break;
-            }
+        if (feedback_lcore == 0U) {
+            rte_exit(EXIT_FAILURE,
+                     "CBFC mode requires at least one worker lcore (e.g. EAL -l 0-1)\n");
         }
-
-        for (i = 0; i < nb_rx; i++) {
-            rte_pktmbuf_free(rx_pkts[i]);
-        }
+        rte_eal_remote_launch(receiver_feedback_loop, &ctx, feedback_lcore);
+        receiver_run_rx_loop(&ctx, burst);
+        rte_eal_wait_lcore(feedback_lcore);
+    } else {
+        receiver_run_rx_loop(&ctx, burst);
     }
 
     rc = flush_flow_stats_to_csv(&ctx, rte_get_timer_cycles());
     if (rc != 0) {
         fprintf(stderr, "failed to write output CSV: %s\n", ctx.cfg.output_path);
     }
+
+    RTE_LOG(INFO, USER1,
+            "receiver exit: received FC data packets=%" PRIu64 ", sent CBFC feedback packets=%"
+            PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
+            ctx.rx_fc_data_pkts, ctx.tx_cbfc_feedback_pkts, ctx.feedback_enqueue_drop);
 
     cleanup_receiver(&ctx);
     return rc == 0 ? 0 : 1;

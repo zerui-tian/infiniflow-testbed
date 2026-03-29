@@ -44,6 +44,7 @@ add_executable(receiver
     src/core/fc_header.h
     src/receiver/receiver_ctx.h
     src/receiver/main.c
+    src/receiver/feedback_tx.c
 )
 
 target_include_directories(receiver PRIVATE

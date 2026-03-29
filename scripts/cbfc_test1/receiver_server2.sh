@@ -22,11 +22,12 @@ DEFAULT_PORT_ID="0"
 DEFAULT_NB_VC="8"
 DEFAULT_RX_BURST="64"
 DEFAULT_TX_BURST="64"
-DEFAULT_PKT_SIZE="1518"
+DEFAULT_PKT_SIZE="1500"
 DEFAULT_MEMPOOL_SIZE="32768"
 # DEFAULT_FC_MODE="none"
 DEFAULT_FC_MODE="cbfc"
 DEFAULT_CBFC_BUFFER_PKTS="8192"
+DEFAULT_FEEDBACK_RING_SIZE="1024"
 DEFAULT_OUTPUT_FILE="${ROOT_DIR}/output/cbfc_test.csv"
 
 EAL_LCORES="${EAL_LCORES:-$DEFAULT_EAL_LCORES}"
@@ -41,6 +42,7 @@ PKT_SIZE="${PKT_SIZE:-$DEFAULT_PKT_SIZE}"
 MEMPOOL_SIZE="${MEMPOOL_SIZE:-$DEFAULT_MEMPOOL_SIZE}"
 FC_MODE="${FC_MODE:-$DEFAULT_FC_MODE}"
 CBFC_BUFFER_PKTS="${CBFC_BUFFER_PKTS:-$DEFAULT_CBFC_BUFFER_PKTS}"
+FEEDBACK_RING_SIZE="${FEEDBACK_RING_SIZE:-$DEFAULT_FEEDBACK_RING_SIZE}"
 OUTPUT_FILE="${OUTPUT_FILE:-$DEFAULT_OUTPUT_FILE}"
 
 to_dpdk_log_level() {
@@ -55,7 +57,7 @@ to_dpdk_log_level() {
     INFO) echo 7 ;;
     DEBUG) echo 8 ;;
     *)
-      echo "[run_receiver] invalid LOG_LEVEL: ${1} (use EMERG|ALERT|CRIT|ERROR|WARN|NOTICE|INFO|DEBUG)" >&2
+      echo "[receiver] invalid LOG_LEVEL: ${1} (use EMERG|ALERT|CRIT|ERROR|WARN|NOTICE|INFO|DEBUG)" >&2
       exit 1
       ;;
   esac
@@ -64,7 +66,7 @@ to_dpdk_log_level() {
 DPDK_LOG_LEVEL="$(to_dpdk_log_level "${LOG_LEVEL}")"
 
 if [[ ! -x "${RECEIVER_BIN}" ]]; then
-  echo "[run_receiver] receiver binary not found, building first..."
+  echo "[receiver_server2] receiver binary not found, building first..."
   cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}"
   cmake --build "${BUILD_DIR}" -j
 fi
@@ -84,6 +86,7 @@ echo "PKT_SIZE:      ${PKT_SIZE}"
 echo "MEMPOOL_SIZE:  ${MEMPOOL_SIZE}"
 echo "FC_MODE:       ${FC_MODE}"
 echo "CBFC_BUFFER:   ${CBFC_BUFFER_PKTS}"
+echo "FB_RING_SIZE:  ${FEEDBACK_RING_SIZE}"
 echo "OUTPUT_FILE:   ${OUTPUT_FILE}"
 echo "========================================"
 echo
@@ -109,6 +112,7 @@ set +e
   --mempool "${MEMPOOL_SIZE}" \
   --fc-mode "${FC_MODE}" \
   --cbfc-buffer-pkts "${CBFC_BUFFER_PKTS}" \
+  --feedback-ring-size "${FEEDBACK_RING_SIZE}" \
   --output "${OUTPUT_FILE}"
 EXIT_CODE=$?
 set -e
@@ -116,10 +120,10 @@ set +x
 
 if [[ ${EXIT_CODE} -ne 0 ]]; then
   echo
-  echo "[run_receiver] exited with code: ${EXIT_CODE}"
+  echo "[receiver] exited with code: ${EXIT_CODE}"
 else
   echo
-  echo "[run_receiver] exited normally"
+  echo "[receiver] exited normally"
 fi
 
 exit "${EXIT_CODE}"

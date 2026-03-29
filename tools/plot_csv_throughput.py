@@ -177,7 +177,7 @@ def main() -> int:
     parser.add_argument(
         "--bins",
         type=int,
-        default=10000,
+        default=1000,
         help="Number of time bins per flow (default: 100)",
     )
     parser.add_argument(
