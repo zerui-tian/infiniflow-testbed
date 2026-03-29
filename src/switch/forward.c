@@ -47,6 +47,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
     for (i = 0; i < ctx->cfg.nb_vc; i++) {
         struct rte_mbuf *burst[256];
         struct rte_mbuf *tx_burst[256];
+        struct rte_ether_addr feedback_dst_addrs[256];
         uint64_t credit = 0;
         uint32_t want_deq = burst_size;
         uint32_t n_deq = 0;
@@ -75,7 +76,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
 
         for (j = 0; j < n_deq; j++) {
             struct rte_mbuf *mbuf = burst[j];
-            const struct rte_ether_hdr *eth_hdr = NULL;
+            struct rte_ether_hdr *eth_hdr = NULL;
             const fc_data_header_t *fc_hdr = NULL;
             uint32_t flow_id = 0;
             uint16_t egress_port = 0;
@@ -86,7 +87,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
                 continue;
             }
 
-            eth_hdr = rte_pktmbuf_mtod(mbuf, const struct rte_ether_hdr *);
+            eth_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
             fc_hdr = (const fc_data_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
             flow_id = rte_be_to_cpu_32(fc_hdr->flow_id);
             egress_port = switch_flow_map_lookup(ctx, flow_id);
@@ -96,6 +97,8 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
                 continue;
             }
 
+            rte_ether_addr_copy(&eth_hdr->src_addr, &feedback_dst_addrs[n_tx_candidates]);
+            rte_ether_addr_copy(&ctx->egress_mac, &eth_hdr->src_addr);
             tx_burst[n_tx_candidates++] = mbuf;
         }
 
@@ -110,14 +113,13 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
 
         for (j = 0; j < n_tx; j++) {
             struct rte_mbuf *mbuf = tx_burst[j];
-            const struct rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(mbuf, const struct rte_ether_hdr *);
             uint16_t ingress_idx = ingress_index_from_port(ctx, mbuf->port);
             uint64_t feedback_fccl = 0;
 
             if (ctx->cfg.fc_mode == FC_MODE_CBFC && ctx->fc_ops != NULL &&
                 ctx->fc_ops->on_tx_success != NULL) {
                 feedback_fccl = ctx->fc_ops->on_tx_success(ctx, i);
-                enqueue_feedback_msg(ctx, ingress_idx, i, feedback_fccl, &eth_hdr->src_addr);
+                enqueue_feedback_msg(ctx, ingress_idx, i, feedback_fccl, &feedback_dst_addrs[j]);
             }
             rte_pktmbuf_free(mbuf);
         }

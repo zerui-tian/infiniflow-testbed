@@ -56,6 +56,7 @@ typedef struct switch_config_s {
 
 typedef struct switch_ctx_s {
     switch_config_t cfg;
+    struct rte_ether_addr egress_mac;
 
     vc_queue_t *vc_queues;
     struct rte_ring **feedback_queues;

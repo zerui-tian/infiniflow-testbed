@@ -75,27 +75,6 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             continue;
         }
 
-        if (eth_hdr->ether_type == rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE)) {
-            const cbfc_feedback_header_t *fb_hdr = NULL;
-            uint32_t vc_id = 0;
-            uint64_t fccl = 0;
-
-            if (mbuf->pkt_len < sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE) {
-                rte_pktmbuf_free(mbuf);
-                continue;
-            }
-
-            fb_hdr = (const cbfc_feedback_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
-            vc_id = rte_be_to_cpu_32(fb_hdr->vc_id);
-            if (vc_id < ctx->cfg.nb_vc && ctx->fc_ops != NULL && ctx->fc_ops->on_feedback_rx != NULL) {
-                fccl = fc_be64_to_cpu(fb_hdr->fccl);
-                ctx->fc_ops->on_feedback_rx(ctx, vc_id, fccl);
-                ctx->total_feedback_rx++;
-            }
-            rte_pktmbuf_free(mbuf);
-            continue;
-        }
-
         rte_pktmbuf_free(mbuf);
     }
 

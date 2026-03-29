@@ -411,6 +411,9 @@ uint16_t switch_flow_map_lookup(const switch_ctx_t *ctx, uint32_t flow_id) {
     switch (flow_id) {
         case 0U:
         case 1U:
+        case 2U:
+        case 3U:
+        case 4U:
             return 0U;
         default:
             return UINT16_MAX;
@@ -622,6 +625,7 @@ int main(int argc, char **argv) {
     if (rc != 0) {
         rte_exit(EXIT_FAILURE, "egress port init failed\n");
     }
+    rte_eth_macaddr_get(ctx.cfg.egress_port, &ctx.egress_mac);
     RTE_LOG(INFO, USER1, "switch: egress port %" PRIu16 " started\n", ctx.cfg.egress_port);
 
     if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0) {
