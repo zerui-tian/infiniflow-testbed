@@ -1,14 +1,14 @@
 #include "sender/sender_ctx.h"
 #include "core/fc_header.h"
 
-#include <inttypes.h>
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include <rte_cycles.h>
 #include <rte_eal.h>
@@ -17,6 +17,7 @@
 #include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_mbuf.h>
+#include <rte_pause.h>
 #include <rte_ring.h>
 
 #define DEFAULT_NB_VC 8U
@@ -28,6 +29,36 @@
 #define DEFAULT_TICK_US 1000U
 #define DEFAULT_INITIAL_FCCL 1024U
 #define MBUF_CACHE_SIZE 256U
+
+typedef struct sender_app_config_s {
+    uint16_t *port_ids;
+    uint16_t nb_ports;
+    char **csv_paths;
+
+    uint32_t nb_vc;
+    uint32_t ring_size;
+    uint32_t packet_size;
+    uint32_t mempool_size;
+    uint32_t tx_burst_size;
+    uint32_t rx_burst_size;
+    uint32_t tick_us;
+    uint64_t initial_fccl;
+    fc_mode_t fc_mode;
+} sender_app_config_t;
+
+typedef struct sender_app_ctx_s {
+    sender_app_config_t cfg;
+    sender_ctx_t *port_ctxs;
+    uint8_t *producer_done;
+    uint64_t global_start_cycles;
+    uint32_t start_flag;
+} sender_app_ctx_t;
+
+typedef struct sender_worker_arg_s {
+    sender_app_ctx_t *app;
+    uint16_t port_idx;
+} sender_worker_arg_t;
+
 static volatile sig_atomic_t g_force_quit = 0;
 
 static void handle_signal(int signum) {
@@ -100,15 +131,177 @@ static int parse_fc_mode(const char *s, fc_mode_t *mode) {
     return -1;
 }
 
+static char *trim_spaces(char *s) {
+    char *end = NULL;
+
+    while (*s != '\0' && isspace((unsigned char)*s)) {
+        s++;
+    }
+    if (*s == '\0') {
+        return s;
+    }
+    end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+    return s;
+}
+
+static int parse_port_list(const char *spec, uint16_t **ports_out, uint16_t *nb_ports_out) {
+    char *dup = NULL;
+    char *saveptr = NULL;
+    char *token = NULL;
+    uint16_t *ports = NULL;
+    uint16_t cap = 0;
+    uint16_t count = 0;
+    int rc = -1;
+
+    if (spec == NULL || ports_out == NULL || nb_ports_out == NULL) {
+        return -1;
+    }
+
+    dup = strdup(spec);
+    if (dup == NULL) {
+        return -1;
+    }
+
+    token = strtok_r(dup, ",", &saveptr);
+    while (token != NULL) {
+        uint16_t port_id = 0;
+        uint16_t i = 0;
+        char *trimmed = trim_spaces(token);
+
+        if (parse_u16(trimmed, &port_id) != 0) {
+            goto out;
+        }
+        for (i = 0; i < count; i++) {
+            if (ports[i] == port_id) {
+                goto out;
+            }
+        }
+        if (count == cap) {
+            uint16_t new_cap = (cap == 0U) ? 4U : (uint16_t)(cap * 2U);
+            uint16_t *new_ports = realloc(ports, new_cap * sizeof(*ports));
+            if (new_ports == NULL) {
+                goto out;
+            }
+            ports = new_ports;
+            cap = new_cap;
+        }
+        ports[count++] = port_id;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    if (count == 0U) {
+        goto out;
+    }
+
+    *ports_out = ports;
+    *nb_ports_out = count;
+    ports = NULL;
+    rc = 0;
+
+out:
+    free(ports);
+    free(dup);
+    return rc;
+}
+
+static int parse_csv_list(const char *spec, char ***csvs_out, uint16_t *nb_csvs_out) {
+    char *dup = NULL;
+    char *saveptr = NULL;
+    char *token = NULL;
+    char **csvs = NULL;
+    uint16_t cap = 0;
+    uint16_t count = 0;
+    uint16_t i = 0;
+    int rc = -1;
+
+    if (spec == NULL || csvs_out == NULL || nb_csvs_out == NULL) {
+        return -1;
+    }
+
+    dup = strdup(spec);
+    if (dup == NULL) {
+        return -1;
+    }
+
+    token = strtok_r(dup, ",", &saveptr);
+    while (token != NULL) {
+        char *trimmed = trim_spaces(token);
+
+        if (*trimmed == '\0') {
+            goto out;
+        }
+        if (count == cap) {
+            uint16_t new_cap = (cap == 0U) ? 4U : (uint16_t)(cap * 2U);
+            char **new_csvs = realloc(csvs, new_cap * sizeof(*csvs));
+            if (new_csvs == NULL) {
+                goto out;
+            }
+            csvs = new_csvs;
+            cap = new_cap;
+        }
+        csvs[count] = strdup(trimmed);
+        if (csvs[count] == NULL) {
+            goto out;
+        }
+        count++;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    if (count == 0U) {
+        goto out;
+    }
+
+    *csvs_out = csvs;
+    *nb_csvs_out = count;
+    csvs = NULL;
+    rc = 0;
+
+out:
+    if (csvs != NULL) {
+        for (i = 0; i < count; i++) {
+            free(csvs[i]);
+        }
+    }
+    free(csvs);
+    free(dup);
+    return rc;
+}
+
+static void free_csv_list(char **csvs, uint16_t nb_csvs) {
+    uint16_t i = 0;
+    if (csvs == NULL) {
+        return;
+    }
+    for (i = 0; i < nb_csvs; i++) {
+        free(csvs[i]);
+    }
+    free(csvs);
+}
+
+static void free_app_config(sender_app_config_t *cfg) {
+    if (cfg == NULL) {
+        return;
+    }
+    free(cfg->port_ids);
+    free_csv_list(cfg->csv_paths, cfg->nb_ports);
+    memset(cfg, 0, sizeof(*cfg));
+}
+
 static void usage(const char *prog) {
-    printf("Usage: %s [EAL args] -- --csv <path> [options]\n", prog);
+    printf("Usage: %s [EAL args] -- [options]\n", prog);
     printf("Options:\n");
-    printf("  --csv <path>         Flow CSV file path (required)\n");
-    printf("  --port <id>          NIC port id (default: 0)\n");
-    printf("  --vcs <num>          Number of VC rings (default: 8)\n");
+    printf("  --csv <path>         Single flow CSV path (legacy mode)\n");
+    printf("  --port <id>          Single NIC port id (legacy mode)\n");
+    printf("  --csvs <p1,p2,...>   Per-port CSV list (required for multi-port)\n");
+    printf("  --ports <a,b,...>    NIC port list for sender instances\n");
+    printf("  --vcs <num>          Number of VC rings per port (default: 8)\n");
     printf("  --ring-size <num>    Ring size per VC (default: 1024)\n");
     printf("  --pkt-size <bytes>   Packet size in bytes (default: 8000)\n");
-    printf("  --mempool <num>      Mempool object count (default: 32768)\n");
+    printf("  --mempool <num>      Mempool object count per port (default: 32768)\n");
     printf("  --tx-burst <num>     TX burst size (default: 64)\n");
     printf("  --rx-burst <num>     RX burst size for feedback (default: 64)\n");
     printf("  --tick-us <num>      Producer tick interval us (default: 1000)\n");
@@ -116,10 +309,12 @@ static void usage(const char *prog) {
     printf("  --initial-fccl <n>   Initial CBFC FCCL per VC (default: 1024)\n");
 }
 
-static int parse_app_args(int argc, char **argv, sender_config_t *cfg) {
+static int parse_app_args(int argc, char **argv, sender_app_config_t *cfg) {
     static const struct option long_opts[] = {
         {"csv", required_argument, 0, 'c'},
         {"port", required_argument, 0, 'p'},
+        {"csvs", required_argument, 0, 'C'},
+        {"ports", required_argument, 0, 'P'},
         {"vcs", required_argument, 0, 'v'},
         {"ring-size", required_argument, 0, 'r'},
         {"pkt-size", required_argument, 0, 's'},
@@ -131,74 +326,229 @@ static int parse_app_args(int argc, char **argv, sender_config_t *cfg) {
         {"initial-fccl", required_argument, 0, 'i'},
         {0, 0, 0, 0},
     };
-
+    uint16_t *port_list = NULL;
+    uint16_t nb_port_list = 0;
+    char **csv_list = NULL;
+    uint16_t nb_csv_list = 0;
+    char *single_csv = NULL;
+    uint16_t single_port = 0;
+    bool has_single_csv = false;
+    bool has_single_port = false;
+    bool has_csv_list = false;
+    bool has_port_list = false;
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "c:p:v:r:s:m:b:x:t:f:i:", long_opts, NULL)) != -1) {
+    if (cfg == NULL) {
+        return -1;
+    }
+
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->nb_vc = DEFAULT_NB_VC;
+    cfg->ring_size = DEFAULT_RING_SIZE;
+    cfg->packet_size = DEFAULT_PKT_SIZE;
+    cfg->mempool_size = DEFAULT_MEMPOOL_SIZE;
+    cfg->tx_burst_size = DEFAULT_TX_BURST;
+    cfg->rx_burst_size = DEFAULT_RX_BURST;
+    cfg->tick_us = DEFAULT_TICK_US;
+    cfg->initial_fccl = DEFAULT_INITIAL_FCCL;
+    cfg->fc_mode = FC_MODE_NONE;
+
+    while ((opt = getopt_long(argc, argv, "c:p:C:P:v:r:s:m:b:x:t:f:i:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c':
-                cfg->csv_path = optarg;
-                break;
-            case 'p':
-                if (parse_u16(optarg, &cfg->port_id) != 0) {
+                free(single_csv);
+                single_csv = strdup(optarg);
+                if (single_csv == NULL) {
                     return -1;
                 }
+                has_single_csv = true;
+                break;
+            case 'p':
+                if (parse_u16(optarg, &single_port) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                has_single_port = true;
+                break;
+            case 'C':
+                if (has_csv_list) {
+                    free(single_csv);
+                    return -1;
+                }
+                if (parse_csv_list(optarg, &csv_list, &nb_csv_list) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                has_csv_list = true;
+                break;
+            case 'P':
+                if (has_port_list) {
+                    free(single_csv);
+                    return -1;
+                }
+                if (parse_port_list(optarg, &port_list, &nb_port_list) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                has_port_list = true;
                 break;
             case 'v':
                 if (parse_u32(optarg, &cfg->nb_vc) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 'r':
                 if (parse_u32(optarg, &cfg->ring_size) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 's':
                 if (parse_u32(optarg, &cfg->packet_size) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 'm':
                 if (parse_u32(optarg, &cfg->mempool_size) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 'b':
                 if (parse_u32(optarg, &cfg->tx_burst_size) != 0) {
-                    return -1;
-                }
-                break;
-            case 't':
-                if (parse_u32(optarg, &cfg->tick_us) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 'x':
                 if (parse_u32(optarg, &cfg->rx_burst_size) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                break;
+            case 't':
+                if (parse_u32(optarg, &cfg->tick_us) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 'f':
                 if (parse_fc_mode(optarg, &cfg->fc_mode) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             case 'i':
                 if (parse_u64(optarg, &cfg->initial_fccl) != 0) {
+                    free(single_csv);
                     return -1;
                 }
                 break;
             default:
+                free(single_csv);
                 return -1;
         }
     }
 
-    if (cfg->csv_path == NULL || cfg->nb_vc == 0U || cfg->ring_size == 0U || cfg->packet_size == 0U ||
-        cfg->tx_burst_size == 0U || cfg->rx_burst_size == 0U || cfg->tick_us == 0U) {
+    if ((has_single_port && has_port_list) || (has_single_csv && has_csv_list)) {
+        free(port_list);
+        free_csv_list(csv_list, nb_csv_list);
+        free(single_csv);
         return -1;
     }
 
+    if (has_port_list && has_csv_list && nb_port_list != nb_csv_list) {
+        free(port_list);
+        free_csv_list(csv_list, nb_csv_list);
+        free(single_csv);
+        return -1;
+    }
+
+    if (has_port_list) {
+        cfg->port_ids = port_list;
+        cfg->nb_ports = nb_port_list;
+        port_list = NULL;
+    } else {
+        cfg->nb_ports = has_csv_list ? nb_csv_list : 1U;
+        cfg->port_ids = calloc(cfg->nb_ports, sizeof(*cfg->port_ids));
+        if (cfg->port_ids == NULL) {
+            free(port_list);
+            free_csv_list(csv_list, nb_csv_list);
+            free(single_csv);
+            return -1;
+        }
+        if (has_single_port || cfg->nb_ports == 1U) {
+            cfg->port_ids[0] = has_single_port ? single_port : 0U;
+        } else {
+            free(port_list);
+            free_csv_list(csv_list, nb_csv_list);
+            free(single_csv);
+            return -1;
+        }
+    }
+
+    if (has_csv_list) {
+        cfg->csv_paths = csv_list;
+        csv_list = NULL;
+    } else {
+        cfg->csv_paths = calloc(cfg->nb_ports, sizeof(*cfg->csv_paths));
+        if (cfg->csv_paths == NULL) {
+            free(port_list);
+            free_csv_list(csv_list, nb_csv_list);
+            free(single_csv);
+            return -1;
+        }
+        if (!has_single_csv) {
+            free(port_list);
+            free_csv_list(csv_list, nb_csv_list);
+            free(single_csv);
+            return -1;
+        }
+        cfg->csv_paths[0] = single_csv;
+        single_csv = NULL;
+    }
+
+    if (cfg->port_ids == NULL || cfg->csv_paths == NULL || cfg->nb_ports == 0U) {
+        free(port_list);
+        free_csv_list(csv_list, nb_csv_list);
+        free(single_csv);
+        return -1;
+    }
+
+    if (cfg->nb_vc == 0U || cfg->ring_size == 0U || cfg->packet_size == 0U ||
+        cfg->tx_burst_size == 0U || cfg->rx_burst_size == 0U || cfg->tick_us == 0U) {
+        free(port_list);
+        free_csv_list(csv_list, nb_csv_list);
+        free(single_csv);
+        return -1;
+    }
+
+    {
+        uint16_t i = 0;
+        uint16_t j = 0;
+        for (i = 0; i < cfg->nb_ports; i++) {
+            if (cfg->csv_paths[i] == NULL || cfg->csv_paths[i][0] == '\0') {
+                free(port_list);
+                free_csv_list(csv_list, nb_csv_list);
+                free(single_csv);
+                return -1;
+            }
+            for (j = (uint16_t)(i + 1U); j < cfg->nb_ports; j++) {
+                if (cfg->port_ids[i] == cfg->port_ids[j]) {
+                    free(port_list);
+                    free_csv_list(csv_list, nb_csv_list);
+                    free(single_csv);
+                    return -1;
+                }
+            }
+        }
+    }
+
+    free(port_list);
+    free_csv_list(csv_list, nb_csv_list);
+    free(single_csv);
     return 0;
 }
 
@@ -269,7 +619,7 @@ static int init_vc_rings(sender_ctx_t *ctx) {
     for (i = 0; i < ctx->cfg.nb_vc; i++) {
         char ring_name[64];
 
-        snprintf(ring_name, sizeof(ring_name), "vc_ring_%u", i);
+        snprintf(ring_name, sizeof(ring_name), "vc_ring_p%u_v%u", ctx->cfg.port_id, i);
         ctx->vc_queues[i].vc_id = i;
         ctx->vc_queues[i].ring =
             rte_ring_create(ring_name, ctx->cfg.ring_size, rte_socket_id(),
@@ -297,55 +647,12 @@ static int init_vc_fc_states(sender_ctx_t *ctx) {
     return 0;
 }
 
-static int producer_loop(void *arg) {
-    sender_ctx_t *ctx = (sender_ctx_t *)arg;
-
-    /* Use producer thread start as scheduling time origin. */
-    ctx->start_cycles = rte_get_timer_cycles();
-    while (!g_force_quit) {
-        double now_sec = sender_now_sec(ctx);
-
-        activity_manager_activate_ready(ctx, now_sec);
-        scheduler_run_tick(ctx);
-        activity_manager_compact(ctx);
-
-        if (activity_manager_all_done(ctx)) {
-            g_force_quit = 1;
-            break;
-        }
-
-        //usleep(ctx->cfg.tick_us);
-    }
-
-    return 0;
-}
-
-static int forward_loop(void *arg) {
-    sender_ctx_t *ctx = (sender_ctx_t *)arg;
-
-    while (!g_force_quit) {
-        forward_run_tick(ctx);
-    }
-
-    /* Final drain to avoid leftovers in ring when producer exits. */
-    while (forward_run_tick(ctx) > 0U) {
-    }
-
-    return 0;
-}
-
-static int feedback_rx_loop(void *arg) {
-    sender_ctx_t *ctx = (sender_ctx_t *)arg;
-
-    while (!g_force_quit) {
-        sender_feedback_rx_run_tick(ctx);
-    }
-
-    return 0;
-}
-
 static void cleanup_sender(sender_ctx_t *ctx) {
     uint32_t i = 0;
+
+    if (ctx == NULL) {
+        return;
+    }
 
     if (ctx->vc_queues != NULL) {
         for (i = 0; i < ctx->cfg.nb_vc; i++) {
@@ -369,32 +676,152 @@ static void cleanup_sender(sender_ctx_t *ctx) {
     free(ctx->active_ids);
     free(ctx->pending_order);
     free(ctx->flows);
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+static int init_sender_port_ctx(sender_ctx_t *ctx, const sender_app_config_t *app_cfg,
+                                uint16_t port_idx) {
+    uint32_t max_vc_csv = 0;
+    uint32_t data_room_size = 0;
+    char mempool_name[64];
+    int rc = 0;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cfg.csv_path = app_cfg->csv_paths[port_idx];
+    ctx->cfg.port_id = app_cfg->port_ids[port_idx];
+    ctx->cfg.rx_queue_id = 0;
+    ctx->cfg.tx_queue_id = 0;
+    ctx->cfg.nb_vc = app_cfg->nb_vc;
+    ctx->cfg.ring_size = app_cfg->ring_size;
+    ctx->cfg.packet_size = app_cfg->packet_size;
+    ctx->cfg.mempool_size = app_cfg->mempool_size;
+    ctx->cfg.tx_burst_size = app_cfg->tx_burst_size;
+    ctx->cfg.rx_burst_size = app_cfg->rx_burst_size;
+    ctx->cfg.tick_us = app_cfg->tick_us;
+    ctx->cfg.initial_fccl = app_cfg->initial_fccl;
+    ctx->cfg.fc_mode = app_cfg->fc_mode;
+    ctx->hz = rte_get_timer_hz();
+
+    rc = csv_loader_load(ctx->cfg.csv_path, &ctx->flows, &ctx->nb_flows, &max_vc_csv);
+    if (rc != 0 || ctx->nb_flows == 0U) {
+        return -1;
+    }
+    if (max_vc_csv >= ctx->cfg.nb_vc) {
+        return -1;
+    }
+    if (ctx->cfg.packet_size < (RTE_ETHER_HDR_LEN + FC_DATA_HEADER_SIZE)) {
+        return -1;
+    }
+
+    data_room_size = RTE_MAX(ctx->cfg.packet_size, (uint32_t)RTE_ETHER_MAX_LEN) + RTE_PKTMBUF_HEADROOM;
+    if (data_room_size > UINT16_MAX) {
+        return -1;
+    }
+
+    snprintf(mempool_name, sizeof(mempool_name), "sender_mbuf_pool_p%u", ctx->cfg.port_id);
+    ctx->mbuf_pool =
+        rte_pktmbuf_pool_create(mempool_name, ctx->cfg.mempool_size, MBUF_CACHE_SIZE, 0,
+                                (uint16_t)data_room_size, rte_socket_id());
+    if (ctx->mbuf_pool == NULL) {
+        return -1;
+    }
+    if (init_port(ctx) != 0) {
+        return -1;
+    }
+    if (init_vc_rings(ctx) != 0) {
+        return -1;
+    }
+    if (init_vc_fc_states(ctx) != 0) {
+        return -1;
+    }
+    if (activity_manager_init(ctx) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int producer_loop(void *arg) {
+    sender_worker_arg_t *warg = (sender_worker_arg_t *)arg;
+    sender_app_ctx_t *app = warg->app;
+    sender_ctx_t *ctx = &app->port_ctxs[warg->port_idx];
+
+    while (__atomic_load_n(&app->start_flag, __ATOMIC_ACQUIRE) == 0U && !g_force_quit) {
+        rte_pause();
+    }
+    if (g_force_quit) {
+        __atomic_store_n(&app->producer_done[warg->port_idx], 1U, __ATOMIC_RELEASE);
+        return 0;
+    }
+
+    ctx->start_cycles = app->global_start_cycles;
+    while (!g_force_quit) {
+        double now_sec = sender_now_sec(ctx);
+
+        activity_manager_activate_ready(ctx, now_sec);
+        scheduler_run_tick(ctx);
+        activity_manager_compact(ctx);
+
+        if (activity_manager_all_done(ctx)) {
+            break;
+        }
+    }
+
+    __atomic_store_n(&app->producer_done[warg->port_idx], 1U, __ATOMIC_RELEASE);
+    return 0;
+}
+
+static int forward_loop(void *arg) {
+    sender_worker_arg_t *warg = (sender_worker_arg_t *)arg;
+    sender_app_ctx_t *app = warg->app;
+    sender_ctx_t *ctx = &app->port_ctxs[warg->port_idx];
+
+    while (!g_force_quit) {
+        uint32_t n = forward_run_tick(ctx);
+        if (__atomic_load_n(&app->producer_done[warg->port_idx], __ATOMIC_ACQUIRE) != 0U &&
+            activity_manager_all_done(ctx) && n == 0U) {
+            break;
+        }
+    }
+
+    while (forward_run_tick(ctx) > 0U) {
+    }
+
+    return 0;
+}
+
+static int feedback_rx_loop(void *arg) {
+    sender_worker_arg_t *warg = (sender_worker_arg_t *)arg;
+    sender_app_ctx_t *app = warg->app;
+    sender_ctx_t *ctx = &app->port_ctxs[warg->port_idx];
+
+    while (!g_force_quit) {
+        sender_feedback_rx_run_tick(ctx);
+        if (__atomic_load_n(&app->producer_done[warg->port_idx], __ATOMIC_ACQUIRE) != 0U &&
+            activity_manager_all_done(ctx)) {
+            break;
+        }
+    }
+
+    return 0;
 }
 
 int main(int argc, char **argv) {
-    sender_ctx_t ctx;
-    uint32_t max_vc_csv = 0;
-    uint32_t data_room_size = 0;
-    int eal_argc = 0;
-    unsigned int producer_lcore = 0;
-    unsigned int forward_lcore = 0;
-    unsigned int feedback_lcore = 0;
+    sender_app_ctx_t app;
+    sender_worker_arg_t *worker_args = NULL;
+    unsigned int *producer_lcores = NULL;
+    unsigned int *forward_lcores = NULL;
+    unsigned int *feedback_lcores = NULL;
+    unsigned int worker_ids[RTE_MAX_LCORE];
+    uint16_t nb_workers = 0;
+    uint16_t worker_cursor = 0;
+    uint16_t i = 0;
     unsigned int lcore_id = 0;
-    int rc = 0;
+    uint64_t total_enqueued = 0;
+    uint64_t total_tx = 0;
+    int eal_argc = 0;
+    int ret = EXIT_FAILURE;
 
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.cfg.port_id = 0;
-    ctx.cfg.rx_queue_id = 0;
-    ctx.cfg.tx_queue_id = 0;
-    ctx.cfg.nb_vc = DEFAULT_NB_VC;
-    ctx.cfg.ring_size = DEFAULT_RING_SIZE;
-    ctx.cfg.packet_size = DEFAULT_PKT_SIZE;
-    ctx.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
-    ctx.cfg.tx_burst_size = DEFAULT_TX_BURST;
-    ctx.cfg.rx_burst_size = DEFAULT_RX_BURST;
-    ctx.cfg.tick_us = DEFAULT_TICK_US;
-    ctx.cfg.initial_fccl = DEFAULT_INITIAL_FCCL;
-    ctx.cfg.fc_mode = FC_MODE_NONE;
+    memset(&app, 0, sizeof(app));
 
     eal_argc = rte_eal_init(argc, argv);
     if (eal_argc < 0) {
@@ -406,7 +833,7 @@ int main(int argc, char **argv) {
     argv += eal_argc;
     optind = 1;
 
-    if (parse_app_args(argc, argv, &ctx.cfg) != 0) {
+    if (parse_app_args(argc, argv, &app.cfg) != 0) {
         usage("sender");
         rte_exit(EXIT_FAILURE, "Invalid app arguments\n");
     }
@@ -414,76 +841,91 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    rc = csv_loader_load(ctx.cfg.csv_path, &ctx.flows, &ctx.nb_flows, &max_vc_csv);
-    if (rc != 0 || ctx.nb_flows == 0U) {
-        rte_exit(EXIT_FAILURE, "CSV load failed or no flow found\n");
+    if (app.cfg.nb_ports == 0U) {
+        fprintf(stderr, "no sender ports configured\n");
+        goto out;
     }
 
-    if (max_vc_csv >= ctx.cfg.nb_vc) {
-        rte_exit(EXIT_FAILURE, "CSV vc id exceeds configured --vcs\n");
+    app.port_ctxs = calloc(app.cfg.nb_ports, sizeof(*app.port_ctxs));
+    app.producer_done = calloc(app.cfg.nb_ports, sizeof(*app.producer_done));
+    worker_args = calloc(app.cfg.nb_ports, sizeof(*worker_args));
+    producer_lcores = calloc(app.cfg.nb_ports, sizeof(*producer_lcores));
+    forward_lcores = calloc(app.cfg.nb_ports, sizeof(*forward_lcores));
+    feedback_lcores = calloc(app.cfg.nb_ports, sizeof(*feedback_lcores));
+    if (app.port_ctxs == NULL || app.producer_done == NULL || worker_args == NULL ||
+        producer_lcores == NULL || forward_lcores == NULL || feedback_lcores == NULL) {
+        fprintf(stderr, "allocation failed for multi-port sender state\n");
+        goto out;
     }
 
-    if (ctx.cfg.packet_size < (RTE_ETHER_HDR_LEN + FC_DATA_HEADER_SIZE)) {
-        rte_exit(EXIT_FAILURE, "Packet size too small for Ethernet+FC headers\n");
-    }
-
-    /* RX queue setup needs mbuf room for full L2 frame even when pkt-size is MTU-like (e.g. 1500). */
-    data_room_size = RTE_MAX(ctx.cfg.packet_size, (uint32_t)RTE_ETHER_MAX_LEN) + RTE_PKTMBUF_HEADROOM;
-    if (data_room_size > UINT16_MAX) {
-        rte_exit(EXIT_FAILURE, "Packet size too large for mbuf data room\n");
-    }
-
-    ctx.hz = rte_get_timer_hz();
-
-    ctx.mbuf_pool =
-        rte_pktmbuf_pool_create("sender_mbuf_pool", ctx.cfg.mempool_size, MBUF_CACHE_SIZE, 0,
-                                (uint16_t)data_room_size, rte_socket_id());
-    if (ctx.mbuf_pool == NULL) {
-        rte_exit(EXIT_FAILURE, "mempool create failed\n");
-    }
-
-    if (init_port(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "port init failed\n");
-    }
-
-    if (init_vc_rings(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "ring init failed\n");
-    }
-
-    if (init_vc_fc_states(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "vc flow-control state init failed\n");
-    }
-
-    if (activity_manager_init(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "activity manager init failed\n");
-    }
-
-    RTE_LCORE_FOREACH_WORKER(lcore_id) {
-        if (producer_lcore == 0U) {
-            producer_lcore = lcore_id;
-        } else if (forward_lcore == 0U) {
-            forward_lcore = lcore_id;
-        } else if (feedback_lcore == 0U) {
-            feedback_lcore = lcore_id;
-            break;
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        uint16_t port_id = app.cfg.port_ids[i];
+        if (!rte_eth_dev_is_valid_port(port_id)) {
+            fprintf(stderr, "invalid sender port id=%u\n", port_id);
+            goto out;
+        }
+        if (init_sender_port_ctx(&app.port_ctxs[i], &app.cfg, i) != 0) {
+            fprintf(stderr, "init failed for sender port=%u csv=%s\n", port_id, app.cfg.csv_paths[i]);
+            goto out;
         }
     }
 
-    if (producer_lcore == 0U || forward_lcore == 0U || feedback_lcore == 0U) {
-        rte_exit(EXIT_FAILURE, "Need at least 3 worker lcores for producer/forward/feedback-rx\n");
+    RTE_LCORE_FOREACH_WORKER(lcore_id) {
+        if (nb_workers < RTE_DIM(worker_ids)) {
+            worker_ids[nb_workers++] = lcore_id;
+        }
+    }
+    if (nb_workers < (uint16_t)(app.cfg.nb_ports * 3U)) {
+        fprintf(stderr, "Need at least %u worker lcores for %u ports\n", app.cfg.nb_ports * 3U,
+                app.cfg.nb_ports);
+        goto out;
     }
 
-    rte_eal_remote_launch(producer_loop, &ctx, producer_lcore);
-    rte_eal_remote_launch(forward_loop, &ctx, forward_lcore);
-    rte_eal_remote_launch(feedback_rx_loop, &ctx, feedback_lcore);
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        producer_lcores[i] = worker_ids[worker_cursor++];
+        forward_lcores[i] = worker_ids[worker_cursor++];
+        feedback_lcores[i] = worker_ids[worker_cursor++];
+        worker_args[i].app = &app;
+        worker_args[i].port_idx = i;
+    }
 
-    rte_eal_wait_lcore(producer_lcore);
-    rte_eal_wait_lcore(forward_lcore);
-    rte_eal_wait_lcore(feedback_lcore);
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        rte_eal_remote_launch(producer_loop, &worker_args[i], producer_lcores[i]);
+        rte_eal_remote_launch(forward_loop, &worker_args[i], forward_lcores[i]);
+        rte_eal_remote_launch(feedback_rx_loop, &worker_args[i], feedback_lcores[i]);
+    }
 
-    printf("Sender completed. enqueued=%" PRIu64 ", tx=%" PRIu64 "\n", ctx.total_pkts_enqueued,
-           ctx.total_pkts_tx);
+    app.global_start_cycles = rte_get_timer_cycles();
+    __atomic_store_n(&app.start_flag, 1U, __ATOMIC_RELEASE);
 
-    cleanup_sender(&ctx);
-    return 0;
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        rte_eal_wait_lcore(producer_lcores[i]);
+        rte_eal_wait_lcore(forward_lcores[i]);
+        rte_eal_wait_lcore(feedback_lcores[i]);
+    }
+
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        printf("Sender port=%u completed. enqueued=%" PRIu64 ", tx=%" PRIu64 ", csv=%s\n",
+               app.port_ctxs[i].cfg.port_id, app.port_ctxs[i].total_pkts_enqueued,
+               app.port_ctxs[i].total_pkts_tx, app.port_ctxs[i].cfg.csv_path);
+        total_enqueued += app.port_ctxs[i].total_pkts_enqueued;
+        total_tx += app.port_ctxs[i].total_pkts_tx;
+    }
+    printf("Sender total completed. enqueued=%" PRIu64 ", tx=%" PRIu64 "\n", total_enqueued, total_tx);
+    ret = EXIT_SUCCESS;
+
+out:
+    if (app.port_ctxs != NULL) {
+        for (i = 0; i < app.cfg.nb_ports; i++) {
+            cleanup_sender(&app.port_ctxs[i]);
+        }
+    }
+    free(feedback_lcores);
+    free(forward_lcores);
+    free(producer_lcores);
+    free(worker_args);
+    free(app.producer_done);
+    free(app.port_ctxs);
+    free_app_config(&app.cfg);
+    return ret;
 }

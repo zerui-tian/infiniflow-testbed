@@ -36,11 +36,9 @@ static void enqueue_feedback_msg(switch_ctx_t *ctx, uint16_t ingress_idx, uint32
         rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
         return;
     }
-    ctx->total_feedback_generated++;
 }
 
 uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
-    uint32_t burst_size = (ctx->cfg.tx_burst_size > 256U) ? 256U : ctx->cfg.tx_burst_size;
     uint32_t total_tx = 0;
     uint32_t i = 0;
 
@@ -68,7 +66,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
             continue;
         }
 
-        n_deq = rte_ring_sc_dequeue_burst(ctx->vc_queues[i].ring, (void **)burst, 1, NULL);
+        n_deq = rte_ring_sc_dequeue_burst(ctx->vc_queues[i].ring, (void **)burst, want_deq, NULL);
         if (n_deq == 0U) {
             continue;
         }
@@ -83,7 +81,6 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
 
             if (mbuf->pkt_len < sizeof(struct rte_ether_hdr) + FC_DATA_HEADER_SIZE) {
                 rte_pktmbuf_free(mbuf);
-                ctx->total_tx_drop++;
                 continue;
             }
 
@@ -93,7 +90,6 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
             egress_port = switch_flow_map_lookup(ctx, flow_id);
             if (egress_port != ctx->cfg.egress_port) {
                 rte_pktmbuf_free(mbuf);
-                ctx->total_tx_drop++;
                 continue;
             }
 
@@ -109,7 +105,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
         n_tx = rte_eth_tx_burst(ctx->cfg.egress_port, ctx->cfg.egress_tx_queue_id, tx_burst,
                                 (uint16_t)n_tx_candidates);
         total_tx += n_tx;
-        ctx->total_tx_ok += n_tx;
+        ctx->egress_tx_ok_pkts += n_tx;
 
         for (j = 0; j < n_tx; j++) {
             struct rte_mbuf *mbuf = tx_burst[j];
@@ -127,7 +123,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
 
         for (j = n_tx; j < n_tx_candidates; j++) {
             rte_pktmbuf_free(tx_burst[j]);
-            ctx->total_tx_drop++;
+            ctx->egress_tx_drop_pkts++;
         }
     }
 

@@ -14,13 +14,13 @@ BUILD_DIR="${ROOT_DIR}/build"
 SENDER_BIN="${BUILD_DIR}/sender"
 
 # 默认参数（可直接运行）
-DEFAULT_EAL_LCORES="1-8"
-DEFAULT_EAL_MEM_CHANNELS="4"
-DEFAULT_EAL_PCI_ADDR="0000:41:00.0"
+DEFAULT_EAL_LCORES="1-16"
+DEFAULT_EAL_MEM_CHANNELS="8"
+DEFAULT_EAL_PCI_ADDRS="0000:41:00.0,0000:41:00.1"
 DEFAULT_LOG_LEVEL="INFO"
-DEFAULT_CSV_FILE="${ROOT_DIR}/examples/cbfc_test.csv"
-# DEFAULT_CSV_FILE="${ROOT_DIR}/examples/flows_sgh.csv"
-DEFAULT_PORT_ID="0"
+DEFAULT_CSV_FILES="${ROOT_DIR}/examples/cbfc_test_sender1.csv,${ROOT_DIR}/examples/cbfc_test_sender2.csv"
+# DEFAULT_CSV_FILES="${ROOT_DIR}/examples/flows_sgh.csv,${ROOT_DIR}/examples/flows_sgh.csv"
+DEFAULT_PORT_IDS="0,1"
 DEFAULT_NB_VC="4"
 DEFAULT_RING_SIZE="8192"
 DEFAULT_PKT_SIZE="9000"
@@ -34,10 +34,10 @@ DEFAULT_INITIAL_FCCL="10"
 
 EAL_LCORES="${EAL_LCORES:-$DEFAULT_EAL_LCORES}"
 EAL_MEM_CHANNELS="${EAL_MEM_CHANNELS:-$DEFAULT_EAL_MEM_CHANNELS}"
-EAL_PCI_ADDR="${EAL_PCI_ADDR:-$DEFAULT_EAL_PCI_ADDR}"
+EAL_PCI_ADDRS="${EAL_PCI_ADDRS:-${EAL_PCI_ADDR:-$DEFAULT_EAL_PCI_ADDRS}}"
 LOG_LEVEL="${LOG_LEVEL:-$DEFAULT_LOG_LEVEL}"
-CSV_FILE="${CSV_FILE:-$DEFAULT_CSV_FILE}"
-PORT_ID="${PORT_ID:-$DEFAULT_PORT_ID}"
+CSV_FILES="${CSV_FILES:-${CSV_FILE:-$DEFAULT_CSV_FILES}}"
+PORT_IDS="${PORT_IDS:-${PORT_ID:-$DEFAULT_PORT_IDS}}"
 NB_VC="${NB_VC:-$DEFAULT_NB_VC}"
 RING_SIZE="${RING_SIZE:-$DEFAULT_RING_SIZE}"
 PKT_SIZE="${PKT_SIZE:-$DEFAULT_PKT_SIZE}"
@@ -74,20 +74,62 @@ if [[ ! -x "${SENDER_BIN}" ]]; then
   cmake --build "${BUILD_DIR}" -j
 fi
 
-if [[ ! -f "${CSV_FILE}" ]]; then
-  echo "[run_sender] CSV file not found: ${CSV_FILE}" >&2
+split_csv() {
+  local input="$1"
+  local -n out_arr="$2"
+  out_arr=()
+  IFS=',' read -r -a out_arr <<< "${input}"
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "${s}"
+}
+
+split_csv "${PORT_IDS}" PORT_ARR
+split_csv "${CSV_FILES}" CSV_ARR
+split_csv "${EAL_PCI_ADDRS}" PCI_ARR
+
+if [[ ${#PORT_ARR[@]} -eq 0 || ${#CSV_ARR[@]} -eq 0 ]]; then
+  echo "[run_sender] PORT_IDS/CSV_FILES cannot be empty" >&2
   exit 1
 fi
+
+if [[ ${#PORT_ARR[@]} -ne ${#CSV_ARR[@]} ]]; then
+  echo "[run_sender] port/csv count mismatch: ports=${#PORT_ARR[@]} csvs=${#CSV_ARR[@]}" >&2
+  echo "[run_sender] PORT_IDS=${PORT_IDS}" >&2
+  echo "[run_sender] CSV_FILES=${CSV_FILES}" >&2
+  exit 1
+fi
+
+for i in "${!PORT_ARR[@]}"; do
+  PORT_ARR[$i]="$(trim "${PORT_ARR[$i]}")"
+  CSV_ARR[$i]="$(trim "${CSV_ARR[$i]}")"
+  if [[ -z "${PORT_ARR[$i]}" || -z "${CSV_ARR[$i]}" ]]; then
+    echo "[run_sender] empty entry in PORT_IDS/CSV_FILES at index ${i}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${CSV_ARR[$i]}" ]]; then
+    echo "[run_sender] CSV file not found: ${CSV_ARR[$i]}" >&2
+    exit 1
+  fi
+done
+
+for i in "${!PCI_ARR[@]}"; do
+  PCI_ARR[$i]="$(trim "${PCI_ARR[$i]}")"
+done
 
 echo "========================================"
 echo "Start sender"
 echo "========================================"
 echo "EAL_LCORES:    ${EAL_LCORES}"
 echo "EAL_MEM_CH:    ${EAL_MEM_CHANNELS}"
-echo "EAL_PCI_ADDR:  ${EAL_PCI_ADDR:-<empty>}"
+echo "EAL_PCI_ADDRS: ${EAL_PCI_ADDRS:-<empty>}"
 echo "LOG_LEVEL:     ${LOG_LEVEL} (${DPDK_LOG_LEVEL})"
-echo "CSV_FILE:      ${CSV_FILE}"
-echo "PORT_ID:       ${PORT_ID}"
+echo "CSV_FILES:     ${CSV_FILES}"
+echo "PORT_IDS:      ${PORT_IDS}"
 echo "NB_VC:         ${NB_VC}"
 echo "RING_SIZE:     ${RING_SIZE}"
 echo "PKT_SIZE:      ${PKT_SIZE}"
@@ -105,16 +147,18 @@ EAL_OPTS=(
   -n "${EAL_MEM_CHANNELS}"
   --log-level "${DPDK_LOG_LEVEL}"
 )
-if [[ -n "${EAL_PCI_ADDR}" ]]; then
-  EAL_OPTS+=(-a "${EAL_PCI_ADDR}")
-fi
+for pci in "${PCI_ARR[@]}"; do
+  if [[ -n "${pci}" ]]; then
+    EAL_OPTS+=(-a "${pci}")
+  fi
+done
 
 
 set -x
 set +e
 "${SENDER_BIN}" "${EAL_OPTS[@]}" -- \
-  --csv "${CSV_FILE}" \
-  --port "${PORT_ID}" \
+  --csvs "${CSV_FILES}" \
+  --ports "${PORT_IDS}" \
   --vcs "${NB_VC}" \
   --ring-size "${RING_SIZE}" \
   --pkt-size "${PKT_SIZE}" \

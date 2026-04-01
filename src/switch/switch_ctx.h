@@ -68,13 +68,11 @@ typedef struct switch_ctx_s {
 
     const switch_fc_ops_t *fc_ops;
 
-    uint64_t total_data_rx;
-    uint64_t total_feedback_rx;
-    uint64_t total_enqueued;
-    uint64_t total_tx_ok;
-    uint64_t total_tx_drop;
-    uint64_t total_feedback_generated;
-    uint64_t total_feedback_sent;
+    uint64_t ingress_rx_pkts[SWITCH_MAX_INGRESS_PORTS];
+    uint64_t ingress_enqueued_pkts[SWITCH_MAX_INGRESS_PORTS];
+    uint64_t ingress_drop_pkts[SWITCH_MAX_INGRESS_PORTS];
+    uint64_t egress_tx_ok_pkts;
+    uint64_t egress_tx_drop_pkts;
 } switch_ctx_t;
 
 int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);

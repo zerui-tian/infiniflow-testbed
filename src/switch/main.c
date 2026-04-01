@@ -691,11 +691,16 @@ int main(int argc, char **argv) {
     rte_eal_wait_lcore(forward_lcore);
     rte_eal_wait_lcore(handler_lcore);
 
-    printf("Switch completed. data-rx=%" PRIu64 " feedback-rx=%" PRIu64 " enqueued=%" PRIu64
-           " tx-ok=%" PRIu64 " tx-drop=%" PRIu64 " feedback-gen=%" PRIu64 " feedback-sent=%" PRIu64
-           "\n",
-           ctx.total_data_rx, ctx.total_feedback_rx, ctx.total_enqueued, ctx.total_tx_ok,
-           ctx.total_tx_drop, ctx.total_feedback_generated, ctx.total_feedback_sent);
+    printf("Switch completed.\n");
+
+    for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
+        uint16_t port_id = ctx.cfg.ingress_ports[ingress_idx];
+        printf("switch ingress port %" PRIu16 ": rx=%" PRIu64 " enqueued=%" PRIu64 " drop=%" PRIu64 "\n",
+               port_id, ctx.ingress_rx_pkts[ingress_idx], ctx.ingress_enqueued_pkts[ingress_idx],
+               ctx.ingress_drop_pkts[ingress_idx]);
+    }
+    printf("switch egress port %" PRIu16 ": tx-ok=%" PRIu64 " tx-drop=%" PRIu64 "\n", ctx.cfg.egress_port,
+           ctx.egress_tx_ok_pkts, ctx.egress_tx_drop_pkts);
 
     cleanup_switch(&ctx);
     free(worker_args);

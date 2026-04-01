@@ -29,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-FIXED_PACKET_SIZE_BYTES = 1500
+FIXED_PACKET_SIZE_BYTES = 9000
 
 
 def _ensure_csv_field_limit() -> None:

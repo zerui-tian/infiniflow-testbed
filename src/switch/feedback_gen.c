@@ -63,7 +63,6 @@ uint32_t switch_feedback_gen_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
     }
 
     tx_count = rte_eth_tx_burst(ingress_port, ctx->cfg.ingress_tx_queue_id, tx_pkts, (uint16_t)prepared);
-    ctx->total_feedback_sent += tx_count;
 
     for (i = tx_count; i < prepared; i++) {
         rte_pktmbuf_free(tx_pkts[i]);

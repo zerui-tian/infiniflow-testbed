@@ -35,8 +35,11 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
         struct rte_mbuf *mbuf = rx_pkts[i];
         const struct rte_ether_hdr *eth_hdr = NULL;
 
+        ctx->ingress_rx_pkts[ingress_idx]++;
+
         if (mbuf->pkt_len < sizeof(struct rte_ether_hdr)) {
             rte_pktmbuf_free(mbuf);
+            ctx->ingress_drop_pkts[ingress_idx]++;
             continue;
         }
 
@@ -48,6 +51,7 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
 
             if (mbuf->pkt_len < sizeof(*eth_hdr) + FC_DATA_HEADER_SIZE) {
                 rte_pktmbuf_free(mbuf);
+                ctx->ingress_drop_pkts[ingress_idx]++;
                 continue;
             }
 
@@ -55,27 +59,30 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             vc_id = rte_be_to_cpu_32(fc_hdr->vc_id);
             if (vc_id >= ctx->cfg.nb_vc) {
                 rte_pktmbuf_free(mbuf);
+                ctx->ingress_drop_pkts[ingress_idx]++;
                 continue;
             }
             vc_state = &ctx->vc_states[vc_id];
             if (try_reserve_vc_slot(vc_state) != 0) {
                 rte_pktmbuf_free(mbuf);
+                ctx->ingress_drop_pkts[ingress_idx]++;
                 continue;
             }
 
             if (rte_ring_mp_enqueue(ctx->vc_queues[vc_id].ring, mbuf) != 0) {
                 __atomic_fetch_sub(&vc_state->occupancy, 1U, __ATOMIC_RELAXED);
                 rte_pktmbuf_free(mbuf);
+                ctx->ingress_drop_pkts[ingress_idx]++;
                 continue;
             }
 
-            ctx->total_data_rx++;
-            ctx->total_enqueued++;
+            ctx->ingress_enqueued_pkts[ingress_idx]++;
             enqueued++;
             continue;
         }
 
         rte_pktmbuf_free(mbuf);
+        ctx->ingress_drop_pkts[ingress_idx]++;
     }
 
     return enqueued;
