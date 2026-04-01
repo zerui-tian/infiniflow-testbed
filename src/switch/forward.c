@@ -49,7 +49,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
         struct rte_mbuf *tx_burst[256];
         struct rte_ether_addr feedback_dst_addrs[256];
         uint64_t credit = 0;
-        uint32_t want_deq = burst_size;
+        uint32_t want_deq = 1;
         uint32_t n_deq = 0;
         uint32_t n_tx_candidates = 0;
         uint16_t n_tx = 0;
@@ -68,7 +68,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
             continue;
         }
 
-        n_deq = rte_ring_sc_dequeue_burst(ctx->vc_queues[i].ring, (void **)burst, want_deq, NULL);
+        n_deq = rte_ring_sc_dequeue_burst(ctx->vc_queues[i].ring, (void **)burst, 1, NULL);
         if (n_deq == 0U) {
             continue;
         }
@@ -123,6 +123,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
             }
             rte_pktmbuf_free(mbuf);
         }
+        // TODO: 发送失败时，需要处理失败的情况，比如重发
 
         for (j = n_tx; j < n_tx_candidates; j++) {
             rte_pktmbuf_free(tx_burst[j]);
