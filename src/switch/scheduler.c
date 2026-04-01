@@ -35,11 +35,8 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
         struct rte_mbuf *mbuf = rx_pkts[i];
         const struct rte_ether_hdr *eth_hdr = NULL;
 
-        ctx->ingress_rx_pkts[ingress_idx]++;
-
         if (mbuf->pkt_len < sizeof(struct rte_ether_hdr)) {
             rte_pktmbuf_free(mbuf);
-            ctx->ingress_drop_pkts[ingress_idx]++;
             continue;
         }
 
@@ -48,10 +45,11 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             const fc_data_header_t *fc_hdr = NULL;
             uint32_t vc_id = 0;
             switch_vc_fc_state_t *vc_state = NULL;
+            switch_vc_stats_t *vc_stats = NULL;
+            size_t stats_idx = 0;
 
             if (mbuf->pkt_len < sizeof(*eth_hdr) + FC_DATA_HEADER_SIZE) {
                 rte_pktmbuf_free(mbuf);
-                ctx->ingress_drop_pkts[ingress_idx]++;
                 continue;
             }
 
@@ -59,30 +57,32 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             vc_id = rte_be_to_cpu_32(fc_hdr->vc_id);
             if (vc_id >= ctx->cfg.nb_vc) {
                 rte_pktmbuf_free(mbuf);
-                ctx->ingress_drop_pkts[ingress_idx]++;
                 continue;
             }
+
+            stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + vc_id;
+            vc_stats = &ctx->vc_stats[stats_idx];
+            __atomic_fetch_add(&vc_stats->rx_pkts, 1U, __ATOMIC_RELAXED);
+
             vc_state = &ctx->vc_states[vc_id];
             if (try_reserve_vc_slot(vc_state) != 0) {
                 rte_pktmbuf_free(mbuf);
-                ctx->ingress_drop_pkts[ingress_idx]++;
+                __atomic_fetch_add(&vc_stats->drop_capacity_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
             if (rte_ring_mp_enqueue(ctx->vc_queues[vc_id].ring, mbuf) != 0) {
                 __atomic_fetch_sub(&vc_state->occupancy, 1U, __ATOMIC_RELAXED);
                 rte_pktmbuf_free(mbuf);
-                ctx->ingress_drop_pkts[ingress_idx]++;
+                __atomic_fetch_add(&vc_stats->drop_other_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
-            ctx->ingress_enqueued_pkts[ingress_idx]++;
             enqueued++;
             continue;
         }
 
         rte_pktmbuf_free(mbuf);
-        ctx->ingress_drop_pkts[ingress_idx]++;
     }
 
     return enqueued;

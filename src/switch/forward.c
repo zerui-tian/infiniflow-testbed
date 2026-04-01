@@ -105,25 +105,34 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
         n_tx = rte_eth_tx_burst(ctx->cfg.egress_port, ctx->cfg.egress_tx_queue_id, tx_burst,
                                 (uint16_t)n_tx_candidates);
         total_tx += n_tx;
-        ctx->egress_tx_ok_pkts += n_tx;
 
         for (j = 0; j < n_tx; j++) {
             struct rte_mbuf *mbuf = tx_burst[j];
             uint16_t ingress_idx = ingress_index_from_port(ctx, mbuf->port);
             uint64_t feedback_fccl = 0;
+            size_t stats_idx = 0;
 
             if (ctx->cfg.fc_mode == FC_MODE_CBFC && ctx->fc_ops != NULL &&
                 ctx->fc_ops->on_tx_success != NULL) {
                 feedback_fccl = ctx->fc_ops->on_tx_success(ctx, i);
                 enqueue_feedback_msg(ctx, ingress_idx, i, feedback_fccl, &feedback_dst_addrs[j]);
             }
+            if (ingress_idx < ctx->cfg.nb_ingress_ports) {
+                stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + i;
+                __atomic_fetch_add(&ctx->vc_stats[stats_idx].tx_ok_pkts, 1U, __ATOMIC_RELAXED);
+            }
             rte_pktmbuf_free(mbuf);
         }
         // TODO: 发送失败时，需要处理失败的情况，比如重发
 
         for (j = n_tx; j < n_tx_candidates; j++) {
+            uint16_t ingress_idx = ingress_index_from_port(ctx, tx_burst[j]->port);
+
+            if (ingress_idx < ctx->cfg.nb_ingress_ports) {
+                size_t stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + i;
+                __atomic_fetch_add(&ctx->vc_stats[stats_idx].drop_other_pkts, 1U, __ATOMIC_RELAXED);
+            }
             rte_pktmbuf_free(tx_burst[j]);
-            ctx->egress_tx_drop_pkts++;
         }
     }
 

@@ -27,6 +27,13 @@ typedef struct switch_feedback_msg_s {
     struct rte_ether_addr dst_addr;
 } switch_feedback_msg_t;
 
+typedef struct switch_vc_stats_s {
+    uint64_t rx_pkts;
+    uint64_t tx_ok_pkts;
+    uint64_t drop_capacity_pkts;
+    uint64_t drop_other_pkts;
+} switch_vc_stats_t;
+
 struct switch_ctx_s;
 typedef struct switch_fc_ops_s {
     uint64_t (*calc_credit)(const struct switch_ctx_s *ctx, uint32_t vc_id);
@@ -68,11 +75,7 @@ typedef struct switch_ctx_s {
 
     const switch_fc_ops_t *fc_ops;
 
-    uint64_t ingress_rx_pkts[SWITCH_MAX_INGRESS_PORTS];
-    uint64_t ingress_enqueued_pkts[SWITCH_MAX_INGRESS_PORTS];
-    uint64_t ingress_drop_pkts[SWITCH_MAX_INGRESS_PORTS];
-    uint64_t egress_tx_ok_pkts;
-    uint64_t egress_tx_drop_pkts;
+    switch_vc_stats_t *vc_stats;
 } switch_ctx_t;
 
 int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);

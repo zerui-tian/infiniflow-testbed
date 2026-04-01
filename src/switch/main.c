@@ -405,6 +405,17 @@ static int init_vc_states(switch_ctx_t *ctx) {
     return 0;
 }
 
+static int init_vc_stats(switch_ctx_t *ctx) {
+    size_t nb_stats = (size_t)ctx->cfg.nb_ingress_ports * ctx->cfg.nb_vc;
+
+    ctx->vc_stats = calloc(nb_stats, sizeof(*ctx->vc_stats));
+    if (ctx->vc_stats == NULL) {
+        return -1;
+    }
+
+    return 0;
+}
+
 uint16_t switch_flow_map_lookup(const switch_ctx_t *ctx, uint32_t flow_id) {
     (void)ctx;
 
@@ -536,6 +547,7 @@ static void cleanup_switch(switch_ctx_t *ctx) {
     }
 
     free(ctx->feedback_pool);
+    free(ctx->vc_stats);
     free(ctx->vc_states);
     free(ctx->feedback_queues);
     free(ctx->feedback_free_queues);
@@ -628,7 +640,8 @@ int main(int argc, char **argv) {
     rte_eth_macaddr_get(ctx.cfg.egress_port, &ctx.egress_mac);
     RTE_LOG(INFO, USER1, "switch: egress port %" PRIu16 " started\n", ctx.cfg.egress_port);
 
-    if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0) {
+    if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0 ||
+        init_vc_stats(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "switch queue/state init failed\n");
     }
 
@@ -695,12 +708,19 @@ int main(int argc, char **argv) {
 
     for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
         uint16_t port_id = ctx.cfg.ingress_ports[ingress_idx];
-        printf("switch ingress port %" PRIu16 ": rx=%" PRIu64 " enqueued=%" PRIu64 " drop=%" PRIu64 "\n",
-               port_id, ctx.ingress_rx_pkts[ingress_idx], ctx.ingress_enqueued_pkts[ingress_idx],
-               ctx.ingress_drop_pkts[ingress_idx]);
+        uint32_t vc_id = 0;
+
+        for (vc_id = 0; vc_id < ctx.cfg.nb_vc; vc_id++) {
+            size_t stats_idx = (size_t)ingress_idx * ctx.cfg.nb_vc + vc_id;
+            const switch_vc_stats_t *stats = &ctx.vc_stats[stats_idx];
+
+            printf(
+                "switch ingress port %" PRIu16 " vc=%" PRIu32
+                ": rx=%" PRIu64 " tx-ok=%" PRIu64 " drop-capacity=%" PRIu64 " drop-other=%" PRIu64 "\n",
+                port_id, vc_id, stats->rx_pkts, stats->tx_ok_pkts, stats->drop_capacity_pkts,
+                stats->drop_other_pkts);
+        }
     }
-    printf("switch egress port %" PRIu16 ": tx-ok=%" PRIu64 " tx-drop=%" PRIu64 "\n", ctx.cfg.egress_port,
-           ctx.egress_tx_ok_pkts, ctx.egress_tx_drop_pkts);
 
     cleanup_switch(&ctx);
     free(worker_args);
