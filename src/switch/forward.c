@@ -26,16 +26,19 @@ static void enqueue_feedback_msg(switch_ctx_t *ctx, uint16_t ingress_idx, uint32
         return;
     }
     if (rte_ring_sc_dequeue(ctx->feedback_free_queues[ingress_idx], (void **)&msg) != 0) {
+        __atomic_fetch_add(&ctx->feedback_stats[ingress_idx].drop_no_free_pkts, 1U, __ATOMIC_RELAXED);
         return;
     }
 
     msg->vc_id = vc_id;
     msg->fccl = fccl;
     rte_ether_addr_copy(dst_addr, &msg->dst_addr);
-    if (rte_ring_sp_enqueue(ctx->feedback_queues[ingress_idx], msg) != 0) {
+    if (rte_ring_mp_enqueue(ctx->feedback_queues[ingress_idx], msg) != 0) {
         rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
+        __atomic_fetch_add(&ctx->feedback_stats[ingress_idx].drop_queue_full_pkts, 1U, __ATOMIC_RELAXED);
         return;
     }
+    __atomic_fetch_add(&ctx->feedback_stats[ingress_idx].enqueue_ok_pkts, 1U, __ATOMIC_RELAXED);
 }
 
 uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
@@ -46,6 +49,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
         struct rte_mbuf *burst[256];
         struct rte_mbuf *tx_burst[256];
         struct rte_ether_addr feedback_dst_addrs[256];
+        uint16_t tx_ingress_idxs[256];
         uint64_t credit = 0;
         uint32_t want_deq = 1;
         uint32_t n_deq = 0;
@@ -78,6 +82,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
             const fc_data_header_t *fc_hdr = NULL;
             uint32_t flow_id = 0;
             uint16_t egress_port = 0;
+            uint16_t ingress_idx = ingress_index_from_port(ctx, mbuf->port);
 
             if (mbuf->pkt_len < sizeof(struct rte_ether_hdr) + FC_DATA_HEADER_SIZE) {
                 rte_pktmbuf_free(mbuf);
@@ -95,6 +100,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
 
             rte_ether_addr_copy(&eth_hdr->src_addr, &feedback_dst_addrs[n_tx_candidates]);
             rte_ether_addr_copy(&ctx->egress_mac, &eth_hdr->src_addr);
+            tx_ingress_idxs[n_tx_candidates] = ingress_idx;
             tx_burst[n_tx_candidates++] = mbuf;
         }
 
@@ -107,8 +113,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
         total_tx += n_tx;
 
         for (j = 0; j < n_tx; j++) {
-            struct rte_mbuf *mbuf = tx_burst[j];
-            uint16_t ingress_idx = ingress_index_from_port(ctx, mbuf->port);
+            uint16_t ingress_idx = tx_ingress_idxs[j];
             uint64_t feedback_fccl = 0;
             size_t stats_idx = 0;
 
@@ -121,12 +126,11 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx) {
                 stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + i;
                 __atomic_fetch_add(&ctx->vc_stats[stats_idx].tx_ok_pkts, 1U, __ATOMIC_RELAXED);
             }
-            rte_pktmbuf_free(mbuf);
         }
         // TODO: 发送失败时，需要处理失败的情况，比如重发
 
         for (j = n_tx; j < n_tx_candidates; j++) {
-            uint16_t ingress_idx = ingress_index_from_port(ctx, tx_burst[j]->port);
+            uint16_t ingress_idx = tx_ingress_idxs[j];
 
             if (ingress_idx < ctx->cfg.nb_ingress_ports) {
                 size_t stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + i;

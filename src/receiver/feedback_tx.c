@@ -12,7 +12,7 @@
 
 int receiver_feedback_init(receiver_ctx_t *ctx) {
     uint32_t j = 0;
-    unsigned int feedback_ring_flags = RING_F_SP_ENQ | RING_F_SC_DEQ | RING_F_EXACT_SZ;
+    unsigned int feedback_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
     /* Match switch: SC dequeue on free ring; enqueue uses rte_ring_mp_enqueue. */
     unsigned int free_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
 
@@ -82,7 +82,7 @@ void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_a
     msg->fccl = fccl;
     rte_ether_addr_copy(dst_addr, &msg->dst_addr);
 
-    if (rte_ring_sp_enqueue(ctx->feedback_ring, msg) != 0) {
+    if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
         if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
             RTE_LOG(ERR, USER1, "receiver: failed to return feedback msg to free ring\n");
         }
@@ -92,6 +92,7 @@ void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_a
 
 uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
     struct rte_mbuf *tx_pkts[256];
+    receiver_feedback_msg_t *tx_msgs[256];
     uint32_t burst = (ctx->cfg.tx_burst_size > 256U) ? 256U : ctx->cfg.tx_burst_size;
     uint32_t prepared = 0;
     uint16_t tx_count = 0;
@@ -104,7 +105,7 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
 
     rte_eth_macaddr_get(ctx->cfg.port_id, &src_mac);
 
-    for (prepared = 0; prepared < burst; prepared++) {
+    while (prepared < burst) {
         receiver_feedback_msg_t *msg = NULL;
         struct rte_mbuf *mbuf = NULL;
         char *packet = NULL;
@@ -117,8 +118,11 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
 
         mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
         if (mbuf == NULL) {
-            if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
-                RTE_LOG(ERR, USER1, "receiver: failed to return feedback msg after mbuf OOM\n");
+            if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
+                if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
+                    RTE_LOG(ERR, USER1, "receiver: failed to recycle feedback msg after mbuf OOM\n");
+                }
+                ctx->feedback_enqueue_drop++;
             }
             break;
         }
@@ -126,8 +130,11 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
         packet = rte_pktmbuf_append(mbuf, sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE);
         if (packet == NULL) {
             rte_pktmbuf_free(mbuf);
-            if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
-                RTE_LOG(ERR, USER1, "receiver: failed to return feedback msg after append fail\n");
+            if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
+                if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
+                    RTE_LOG(ERR, USER1, "receiver: failed to recycle feedback msg after append fail\n");
+                }
+                ctx->feedback_enqueue_drop++;
             }
             continue;
         }
@@ -140,12 +147,8 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
         fb_hdr->vc_id = rte_cpu_to_be_32(msg->vc_id);
         fb_hdr->fccl = fc_cpu_to_be64(msg->fccl);
         tx_pkts[prepared] = mbuf;
-
-        if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
-            RTE_LOG(ERR, USER1, "receiver: failed to return feedback msg to free ring\n");
-            rte_pktmbuf_free(mbuf);
-            break;
-        }
+        tx_msgs[prepared] = msg;
+        prepared++;
     }
 
     if (prepared == 0U) {
@@ -156,8 +159,20 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
                                 (uint16_t)prepared);
     ctx->tx_cbfc_feedback_pkts += (uint64_t)tx_count;
 
+    for (i = 0; i < tx_count; i++) {
+        if (rte_ring_mp_enqueue(ctx->feedback_free_ring, tx_msgs[i]) != 0) {
+            RTE_LOG(ERR, USER1, "receiver: failed to return sent feedback msg to free ring\n");
+        }
+    }
+
     for (i = (uint32_t)tx_count; i < prepared; i++) {
         rte_pktmbuf_free(tx_pkts[i]);
+        if (rte_ring_mp_enqueue(ctx->feedback_ring, tx_msgs[i]) != 0) {
+            if (rte_ring_mp_enqueue(ctx->feedback_free_ring, tx_msgs[i]) != 0) {
+                RTE_LOG(ERR, USER1, "receiver: failed to recycle unsent feedback msg\n");
+            }
+            ctx->feedback_enqueue_drop++;
+        }
     }
 
     return (uint32_t)tx_count;

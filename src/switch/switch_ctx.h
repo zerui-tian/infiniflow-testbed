@@ -34,6 +34,14 @@ typedef struct switch_vc_stats_s {
     uint64_t drop_other_pkts;
 } switch_vc_stats_t;
 
+typedef struct switch_feedback_stats_s {
+    uint64_t enqueue_ok_pkts;
+    uint64_t drop_no_free_pkts;
+    uint64_t drop_queue_full_pkts;
+    uint64_t tx_ok_pkts;
+    uint64_t tx_retry_pkts;
+} switch_feedback_stats_t;
+
 struct switch_ctx_s;
 typedef struct switch_fc_ops_s {
     uint64_t (*calc_credit)(const struct switch_ctx_s *ctx, uint32_t vc_id);
@@ -76,6 +84,7 @@ typedef struct switch_ctx_s {
     const switch_fc_ops_t *fc_ops;
 
     switch_vc_stats_t *vc_stats;
+    switch_feedback_stats_t *feedback_stats;
 } switch_ctx_t;
 
 int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);

@@ -345,7 +345,7 @@ static int init_vc_rings(switch_ctx_t *ctx) {
 static int init_feedback_queues(switch_ctx_t *ctx) {
     uint16_t i = 0;
     uint32_t j = 0;
-    unsigned int feedback_ring_flags = RING_F_SP_ENQ | RING_F_SC_DEQ | RING_F_EXACT_SZ;
+    unsigned int feedback_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
     unsigned int feedback_free_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
 
     ctx->feedback_queues = calloc(ctx->cfg.nb_ingress_ports, sizeof(*ctx->feedback_queues));
@@ -410,6 +410,15 @@ static int init_vc_stats(switch_ctx_t *ctx) {
 
     ctx->vc_stats = calloc(nb_stats, sizeof(*ctx->vc_stats));
     if (ctx->vc_stats == NULL) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int init_feedback_stats(switch_ctx_t *ctx) {
+    ctx->feedback_stats = calloc(ctx->cfg.nb_ingress_ports, sizeof(*ctx->feedback_stats));
+    if (ctx->feedback_stats == NULL) {
         return -1;
     }
 
@@ -547,6 +556,7 @@ static void cleanup_switch(switch_ctx_t *ctx) {
     }
 
     free(ctx->feedback_pool);
+    free(ctx->feedback_stats);
     free(ctx->vc_stats);
     free(ctx->vc_states);
     free(ctx->feedback_queues);
@@ -641,7 +651,7 @@ int main(int argc, char **argv) {
     RTE_LOG(INFO, USER1, "switch: egress port %" PRIu16 " started\n", ctx.cfg.egress_port);
 
     if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0 ||
-        init_vc_stats(&ctx) != 0) {
+        init_vc_stats(&ctx) != 0 || init_feedback_stats(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "switch queue/state init failed\n");
     }
 
@@ -709,6 +719,7 @@ int main(int argc, char **argv) {
     for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
         uint16_t port_id = ctx.cfg.ingress_ports[ingress_idx];
         uint32_t vc_id = 0;
+        const switch_feedback_stats_t *fb_stats = &ctx.feedback_stats[ingress_idx];
 
         for (vc_id = 0; vc_id < ctx.cfg.nb_vc; vc_id++) {
             size_t stats_idx = (size_t)ingress_idx * ctx.cfg.nb_vc + vc_id;
@@ -720,6 +731,19 @@ int main(int argc, char **argv) {
                 port_id, vc_id, stats->rx_pkts, stats->tx_ok_pkts, stats->drop_capacity_pkts,
                 stats->drop_other_pkts);
         }
+
+        printf("switch ingress port %" PRIu16
+               " feedback: enqueue-ok=%" PRIu64 " drop-no-free=%" PRIu64
+               " drop-queue-full=%" PRIu64 " tx-ok=%" PRIu64 " tx-retry=%" PRIu64
+               " queued=%u free=%u\n",
+               port_id,
+               __atomic_load_n(&fb_stats->enqueue_ok_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->drop_no_free_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->drop_queue_full_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->tx_ok_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->tx_retry_pkts, __ATOMIC_RELAXED),
+               rte_ring_count(ctx.feedback_queues[ingress_idx]),
+               rte_ring_count(ctx.feedback_free_queues[ingress_idx]));
     }
 
     cleanup_switch(&ctx);

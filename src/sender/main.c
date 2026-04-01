@@ -635,7 +635,8 @@ static int init_vc_fc_states(sender_ctx_t *ctx) {
     uint32_t i = 0;
 
     ctx->vc_fc_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_fc_states));
-    if (ctx->vc_fc_states == NULL) {
+    ctx->feedback_rx_pkts = calloc(ctx->cfg.nb_vc, sizeof(*ctx->feedback_rx_pkts));
+    if (ctx->vc_fc_states == NULL || ctx->feedback_rx_pkts == NULL) {
         return -1;
     }
 
@@ -671,6 +672,7 @@ static void cleanup_sender(sender_ctx_t *ctx) {
         rte_eth_dev_close(ctx->cfg.port_id);
     }
 
+    free(ctx->feedback_rx_pkts);
     free(ctx->vc_fc_states);
     free(ctx->vc_queues);
     free(ctx->active_ids);
@@ -905,9 +907,24 @@ int main(int argc, char **argv) {
     }
 
     for (i = 0; i < app.cfg.nb_ports; i++) {
+        uint32_t vc_id = 0;
+
         printf("Sender port=%u completed. enqueued=%" PRIu64 ", tx=%" PRIu64 ", csv=%s\n",
                app.port_ctxs[i].cfg.port_id, app.port_ctxs[i].total_pkts_enqueued,
                app.port_ctxs[i].total_pkts_tx, app.port_ctxs[i].cfg.csv_path);
+        for (vc_id = 0; vc_id < app.port_ctxs[i].cfg.nb_vc; vc_id++) {
+            uint64_t fccl = __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].fccl, __ATOMIC_RELAXED);
+            uint64_t fctbs = __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].fctbs, __ATOMIC_RELAXED);
+            uint64_t feedback_rx =
+                __atomic_load_n(&app.port_ctxs[i].feedback_rx_pkts[vc_id], __ATOMIC_RELAXED);
+            uint64_t credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
+
+            printf("  sender port=%u vc=%" PRIu32
+                   ": ring=%u feedback-rx=%" PRIu64 " fccl=%" PRIu64
+                   " fctbs=%" PRIu64 " credit=%" PRIu64 "\n",
+                   app.port_ctxs[i].cfg.port_id, vc_id,
+                   rte_ring_count(app.port_ctxs[i].vc_queues[vc_id].ring), feedback_rx, fccl, fctbs, credit);
+        }
         total_enqueued += app.port_ctxs[i].total_pkts_enqueued;
         total_tx += app.port_ctxs[i].total_pkts_tx;
     }
