@@ -201,9 +201,30 @@ receiver 并不会在 RX fast path 上直接发反馈包，而是先把反馈请
   - `--fc-mode`
   - `--initial-fccl`
 - `receiver_server2.sh`
+  - `--ports`
   - `--fc-mode`
   - `--cbfc-buffer-pkts`
   - `--feedback-ring-size`
+
+receiver 现在支持在一个进程里绑定多个端口，例如：
+
+```text
+./build/receiver ... -- --ports 0,1 --fc-mode cbfc --output output/cbfc_test.csv
+```
+
+这里的语义是：
+
+- 每个端口都会创建独立的 `receiver_ctx_t`
+- 每个端口都有自己的 mempool、flow 统计表、CBFC 状态和反馈队列
+- 所有端口在退出时统一写入同一个 CSV
+
+统一输出的 CSV 格式为：
+
+```text
+port_id,flow_id,timestamp_count,pps,bps,timestamps_sec
+```
+
+其中新增的 `port_id` 列用于区分不同端口上相同的 `flow_id`。
 
 从当前脚本默认值看：
 
@@ -240,12 +261,23 @@ receiver 当前是“每收一个 FC 数据包，就尝试产生一个反馈更�
 - sender 看到的 `fccl` 可能滞后
 - `fccl` 滞后会让 sender 比实际需要更久地停在阻塞状态
 
+多端口模式下，这个压力会按端口线性叠加，但由于每个端口使用独立反馈队列和独立 TX 服务，端口之间不会直接争抢同一份反馈内存。
+
 ### 7.4 流控粒度是 VC，不是 Flow
 
 这套控制逻辑是按 VC 生效的，不是按 flow 生效的：
 
 - 多个 flow 只要共用同一个 `vc_id`，就共用同一份 CBFC 状态
 - 某个 flow 的发送会消耗这个 VC 的公共发送窗口
+
+### 7.5 当前 receiver 的统计热点
+
+receiver 的 CSV 统计仍然保留了两个已知热点：
+
+- flow 表在收包路径上可能触发 `flow_table_rehash()`
+- 每个 flow 的时间戳数组在收包路径上可能触发 `realloc()`
+
+当前实现通过“退出时统一写 CSV”避免了把文件 IO 带进数据面，但上述动态扩容仍会在高流量、多端口场景下放大延迟抖动。若后续需要进一步优化，更合适的方向是把时间戳采集改成预分配 ring + 独立聚合线程，而不是在 RX 线程里直接维护可增长数组。
 
 ## 8. 小结
 

@@ -11,6 +11,8 @@
 
 #include "core/fc_mode.h"
 
+#define RECEIVER_RESOURCE_NAME_LEN 64U
+
 typedef struct receiver_feedback_msg_s {
     uint32_t vc_id;
     uint64_t fccl;
@@ -51,6 +53,10 @@ typedef struct flow_record_s {
 
 typedef struct receiver_ctx_s {
     receiver_config_t cfg;
+    struct rte_ether_addr port_mac;
+    char mempool_name[RECEIVER_RESOURCE_NAME_LEN];
+    char feedback_ring_name[RECEIVER_RESOURCE_NAME_LEN];
+    char feedback_free_ring_name[RECEIVER_RESOURCE_NAME_LEN];
     struct rte_mempool *mbuf_pool;
     uint64_t rx_fc_data_pkts;
     uint64_t tx_cbfc_feedback_pkts;
