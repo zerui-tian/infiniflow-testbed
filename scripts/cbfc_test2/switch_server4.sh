@@ -4,19 +4,17 @@ set -euo pipefail
 #
 # 启动 switch 程序
 #
-# 直接运行:
-#   ./scripts/server3_switch.sh
-# 可通过修改下方默认参数或导出同名环境变量覆盖。
-#
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 SWITCH_BIN="${BUILD_DIR}/switch"
 
-# 默认参数（可直接运行）
 DEFAULT_EAL_LCORES="1-16"
 DEFAULT_EAL_MEM_CHANNELS="8"
-DEFAULT_EAL_PCI_ADDRS="0000:c1:00.0,0000:c1:00.1,0000:81:00.1"
+# DPDK port 0 -> 0000:81:00.1 -> server5 0000:c1:00.0
+# DPDK port 1 -> 0000:c1:00.0 -> server3 0000:41:00.0
+# DPDK port 2 -> 0000:c1:00.1 -> server3 0000:41:00.1
+DEFAULT_EAL_PCI_ADDRS="0000:81:00.1,0000:c1:00.0,0000:c1:00.1"
 DEFAULT_LOG_LEVEL="INFO"
 DEFAULT_INGRESS_PORTS="1,2"
 DEFAULT_EGRESS_PORTS="0"

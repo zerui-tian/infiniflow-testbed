@@ -68,6 +68,7 @@ add_executable(switch
     src/core/vc_ring.h
     src/switch/switch_ctx.h
     src/switch/main.c
+    src/switch/route_table.c
     src/switch/scheduler.c
     src/switch/forward.c
     src/switch/feedback_gen.c
