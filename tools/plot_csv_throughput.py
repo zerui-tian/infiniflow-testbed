@@ -29,7 +29,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-FIXED_PACKET_SIZE_BYTES = 1500
+FIXED_PACKET_SIZE_BYTES = 9000
 
 
 def _ensure_csv_field_limit() -> None:
@@ -177,7 +177,7 @@ def main() -> int:
     parser.add_argument(
         "--bins",
         type=int,
-        default=10000,
+        default=1000,
         help="Number of time bins per flow (default: 100)",
     )
     parser.add_argument(

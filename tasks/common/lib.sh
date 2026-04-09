@@ -38,13 +38,15 @@ resolve_state_path() {
   fi
 }
 
-start_remote_background() {
+start_remote_background_with_env() {
   local host="$1"
   local remote_repo_dir="$2"
   local role_script="$3"
   local profile_rel="$4"
   local run_id="$5"
   local remote_log_path="$6"
+  shift 6
+  local env_kvs=("$@")
   local remote_pid
 
   remote_pid="$(
@@ -53,13 +55,15 @@ start_remote_background() {
       "${role_script}" \
       "${profile_rel}" \
       "${run_id}" \
-      "${remote_log_path}" <<'EOF'
+      "${remote_log_path}" \
+      "${env_kvs[@]}" <<'EOF'
 set -euo pipefail
 repo_dir="$1"
 role_script="$2"
 profile_rel="$3"
 run_id="$4"
 log_path="$5"
+shift 5
 
 if [[ "${repo_dir}" == "~"* ]]; then
   repo_dir="${HOME}${repo_dir#"~"}"
@@ -67,6 +71,12 @@ fi
 
 cd "${repo_dir}"
 mkdir -p "$(dirname "${log_path}")"
+
+for kv in "$@"; do
+  key="${kv%%=*}"
+  value="${kv#*=}"
+  export "${key}=${value}"
+done
 
 TASK_PROFILE="${profile_rel}" TASK_RUN_ID="${run_id}" nohup bash "${role_script}" \
   > "${log_path}" 2>&1 < /dev/null &
@@ -78,6 +88,18 @@ EOF
   remote_pid="${remote_pid//$'\r'/}"
   remote_pid="${remote_pid//$'\n'/}"
   echo "${remote_pid}"
+}
+
+start_remote_background() {
+  local host="$1"
+  local remote_repo_dir="$2"
+  local role_script="$3"
+  local profile_rel="$4"
+  local run_id="$5"
+  local remote_log_path="$6"
+  start_remote_background_with_env \
+    "${host}" "${remote_repo_dir}" "${role_script}" \
+    "${profile_rel}" "${run_id}" "${remote_log_path}"
 }
 
 check_remote_pid() {

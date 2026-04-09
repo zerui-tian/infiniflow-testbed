@@ -1,6 +1,7 @@
 #include "receiver/receiver_ctx.h"
 #include "core/fc_header.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -10,13 +11,16 @@
 #include <string.h>
 
 #include <rte_byteorder.h>
+#include <rte_cycles.h>
 #include <rte_eal.h>
+#include <rte_errno.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_lcore.h>
 #include <rte_log.h>
 #include <rte_mbuf.h>
-#include <rte_cycles.h>
 
+#define DEFAULT_PORTS "0"
 #define DEFAULT_MEMPOOL_SIZE 32768U
 #define DEFAULT_RX_BURST 64U
 #define DEFAULT_TX_BURST 64U
@@ -24,9 +28,36 @@
 #define DEFAULT_CBFC_TOTAL_BUFFER_PKTS 8192U
 #define DEFAULT_PKT_SIZE 8000U
 #define DEFAULT_OUTPUT_PATH "receiver_flow_stats.csv"
+#define DEFAULT_FEEDBACK_RING_SIZE 1024U
 #define MBUF_CACHE_SIZE 256U
 #define FLOW_TABLE_INIT_CAP 1024U
 #define MAX_RX_BURST 256U
+
+typedef struct receiver_app_config_s {
+    uint16_t *port_ids;
+    uint16_t nb_ports;
+    uint32_t rx_burst_size;
+    uint32_t tx_burst_size;
+    uint32_t nb_vc;
+    uint32_t packet_size;
+    uint32_t mempool_size;
+    uint32_t feedback_ring_size;
+    uint64_t cbfc_total_buffer_pkts;
+    fc_mode_t fc_mode;
+    const char *output_path;
+} receiver_app_config_t;
+
+typedef struct receiver_app_s {
+    receiver_app_config_t cfg;
+    receiver_ctx_t *port_ctxs;
+    uint64_t start_cycles;
+    uint64_t hz;
+} receiver_app_t;
+
+typedef struct receiver_worker_arg_s {
+    receiver_app_t *app;
+    uint16_t port_idx;
+} receiver_worker_arg_t;
 
 static volatile sig_atomic_t g_force_quit = 0;
 
@@ -97,23 +128,107 @@ static int parse_fc_mode(const char *s, fc_mode_t *mode) {
     return -1;
 }
 
+static char *trim_spaces(char *s) {
+    char *end = NULL;
+
+    while (*s != '\0' && isspace((unsigned char)*s)) {
+        s++;
+    }
+    if (*s == '\0') {
+        return s;
+    }
+    end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+    return s;
+}
+
+static int parse_port_list(const char *spec, uint16_t **ports_out, uint16_t *nb_ports_out) {
+    char *dup = NULL;
+    char *saveptr = NULL;
+    char *token = NULL;
+    uint16_t *ports = NULL;
+    uint16_t cap = 0;
+    uint16_t count = 0;
+    int rc = -1;
+
+    if (spec == NULL || ports_out == NULL || nb_ports_out == NULL) {
+        return -1;
+    }
+
+    dup = strdup(spec);
+    if (dup == NULL) {
+        return -1;
+    }
+
+    token = strtok_r(dup, ",", &saveptr);
+    while (token != NULL) {
+        uint16_t port_id = 0;
+        uint16_t i = 0;
+        char *trimmed = trim_spaces(token);
+
+        if (parse_u16(trimmed, &port_id) != 0) {
+            goto out;
+        }
+        for (i = 0; i < count; i++) {
+            if (ports[i] == port_id) {
+                goto out;
+            }
+        }
+        if (count == cap) {
+            uint16_t new_cap = (cap == 0U) ? 4U : (uint16_t)(cap * 2U);
+            uint16_t *new_ports = realloc(ports, new_cap * sizeof(*ports));
+            if (new_ports == NULL) {
+                goto out;
+            }
+            ports = new_ports;
+            cap = new_cap;
+        }
+        ports[count++] = port_id;
+        token = strtok_r(NULL, ",", &saveptr);
+    }
+
+    if (count == 0U) {
+        goto out;
+    }
+
+    *ports_out = ports;
+    *nb_ports_out = count;
+    ports = NULL;
+    rc = 0;
+
+out:
+    free(ports);
+    free(dup);
+    return rc;
+}
+
+static void free_app_config(receiver_app_config_t *cfg) {
+    free(cfg->port_ids);
+    cfg->port_ids = NULL;
+    cfg->nb_ports = 0;
+}
+
 static void usage(const char *prog) {
     printf("Usage: %s [EAL args] -- [options]\n", prog);
     printf("Options:\n");
-    printf("  --port <id>          NIC port id (default: 0)\n");
+    printf("  --ports <a,b>        NIC port ids (default: %s)\n", DEFAULT_PORTS);
     printf("  --vcs <num>          Number of virtual channels (default: 8)\n");
     printf("  --rx-burst <num>     RX burst size (default: 64)\n");
     printf("  --tx-burst <num>     TX burst size for feedback (default: 64)\n");
     printf("  --pkt-size <bytes>   Expected packet size in bytes (default: 8000)\n");
-    printf("  --mempool <num>      Mempool object count (default: 32768)\n");
+    printf("  --mempool <num>      Per-port mempool object count (default: 32768)\n");
     printf("  --fc-mode <mode>     Flow control mode: none|cbfc (default: none)\n");
-    printf("  --cbfc-buffer-pkts <num>  Total CBFC buffer packets shared by all VCs (default: 8192)\n");
+    printf("  --cbfc-buffer-pkts <num>  Per-port CBFC buffer packets shared by all VCs (default: 8192)\n");
+    printf("  --feedback-ring-size <num>  Per-port CBFC feedback ring depth (default: 1024)\n");
     printf("  --output <path>      Output CSV file path (default: receiver_flow_stats.csv)\n");
 }
 
-static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
+static int parse_app_args(int argc, char **argv, receiver_app_config_t *cfg) {
     static const struct option long_opts[] = {
-        {"port", required_argument, 0, 'p'},
+        {"ports", required_argument, 0, 'P'},
         {"vcs", required_argument, 0, 'v'},
         {"rx-burst", required_argument, 0, 'b'},
         {"tx-burst", required_argument, 0, 't'},
@@ -121,19 +236,26 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
         {"mempool", required_argument, 0, 'm'},
         {"fc-mode", required_argument, 0, 'f'},
         {"cbfc-buffer-pkts", required_argument, 0, 'c'},
+        {"feedback-ring-size", required_argument, 0, 'q'},
         {"output", required_argument, 0, 'o'},
         {0, 0, 0, 0},
     };
-
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "p:v:b:t:s:m:f:c:o:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:v:b:t:s:m:f:c:q:o:", long_opts, NULL)) != -1) {
         switch (opt) {
-            case 'p':
-                if (parse_u16(optarg, &cfg->port_id) != 0) {
+            case 'P': {
+                uint16_t *port_ids = NULL;
+                uint16_t nb_ports = 0;
+
+                if (parse_port_list(optarg, &port_ids, &nb_ports) != 0) {
                     return -1;
                 }
+                free(cfg->port_ids);
+                cfg->port_ids = port_ids;
+                cfg->nb_ports = nb_ports;
                 break;
+            }
             case 'v':
                 if (parse_u32(optarg, &cfg->nb_vc) != 0) {
                     return -1;
@@ -169,6 +291,11 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
                     return -1;
                 }
                 break;
+            case 'q':
+                if (parse_u32(optarg, &cfg->feedback_ring_size) != 0) {
+                    return -1;
+                }
+                break;
             case 'o':
                 cfg->output_path = optarg;
                 break;
@@ -177,10 +304,26 @@ static int parse_app_args(int argc, char **argv, receiver_config_t *cfg) {
         }
     }
 
-    if (cfg->nb_vc == 0U || cfg->rx_burst_size == 0U || cfg->tx_burst_size == 0U ||
-        cfg->packet_size == 0U || cfg->mempool_size == 0U ||
-        cfg->output_path == NULL) {
+    if (cfg->nb_ports == 0U || cfg->nb_vc == 0U || cfg->rx_burst_size == 0U ||
+        cfg->tx_burst_size == 0U || cfg->packet_size == 0U || cfg->mempool_size == 0U ||
+        cfg->feedback_ring_size == 0U || cfg->output_path == NULL) {
         return -1;
+    }
+
+    return 0;
+}
+
+static int validate_app_config(const receiver_app_config_t *cfg) {
+    uint16_t i = 0;
+
+    if (cfg->packet_size < (RTE_ETHER_HDR_LEN + FC_DATA_HEADER_SIZE)) {
+        return -1;
+    }
+
+    for (i = 0; i < cfg->nb_ports; i++) {
+        if (!rte_eth_dev_is_valid_port(cfg->port_ids[i])) {
+            return -1;
+        }
     }
 
     return 0;
@@ -192,24 +335,41 @@ static int init_port(receiver_ctx_t *ctx) {
     uint16_t nb_rxd = 1024;
     uint16_t nb_txd = 1024;
     uint16_t desired_mtu = 0;
+    int socket_id = rte_eth_dev_socket_id(ctx->cfg.port_id);
     int rc = 0;
+
+    if (socket_id < 0) {
+        socket_id = rte_socket_id();
+    }
 
     memset(&port_conf, 0, sizeof(port_conf));
 
     rc = rte_eth_dev_configure(ctx->cfg.port_id, 1, 1, &port_conf);
     if (rc < 0) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " configure failed: rc=%d err=%d(%s)\n",
+                ctx->cfg.port_id, rc, rte_errno, rte_strerror(rte_errno));
         return rc;
     }
 
-    rc = rte_eth_rx_queue_setup(ctx->cfg.port_id, ctx->cfg.rx_queue_id, nb_rxd,
-                                rte_eth_dev_socket_id(ctx->cfg.port_id), NULL, ctx->mbuf_pool);
+    rc = rte_eth_rx_queue_setup(ctx->cfg.port_id, ctx->cfg.rx_queue_id, nb_rxd, socket_id, NULL,
+                                ctx->mbuf_pool);
     if (rc < 0) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " rx queue setup failed: queue=%" PRIu16
+                " desc=%" PRIu16 " socket=%d rc=%d err=%d(%s)\n",
+                ctx->cfg.port_id, ctx->cfg.rx_queue_id, nb_rxd, socket_id, rc, rte_errno,
+                rte_strerror(rte_errno));
         return rc;
     }
 
-    rc = rte_eth_tx_queue_setup(ctx->cfg.port_id, ctx->cfg.tx_queue_id, nb_txd,
-                                rte_eth_dev_socket_id(ctx->cfg.port_id), NULL);
+    rc = rte_eth_tx_queue_setup(ctx->cfg.port_id, ctx->cfg.tx_queue_id, nb_txd, socket_id, NULL);
     if (rc < 0) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " tx queue setup failed: queue=%" PRIu16
+                " desc=%" PRIu16 " socket=%d rc=%d err=%d(%s)\n",
+                ctx->cfg.port_id, ctx->cfg.tx_queue_id, nb_txd, socket_id, rc, rte_errno,
+                rte_strerror(rte_errno));
         return rc;
     }
 
@@ -218,23 +378,38 @@ static int init_port(receiver_ctx_t *ctx) {
 
         rc = rte_eth_dev_info_get(ctx->cfg.port_id, &dev_info);
         if (rc < 0) {
+            RTE_LOG(ERR, USER1,
+                    "receiver port=%" PRIu16 " dev info get failed: rc=%d err=%d(%s)\n",
+                    ctx->cfg.port_id, rc, rte_errno, rte_strerror(rte_errno));
             return rc;
         }
         if (desired_mtu > dev_info.max_mtu) {
+            RTE_LOG(ERR, USER1,
+                    "receiver port=%" PRIu16 " mtu too large: desired=%" PRIu16
+                    " max=%" PRIu32 " packet_size=%" PRIu32 "\n",
+                    ctx->cfg.port_id, desired_mtu, dev_info.max_mtu, ctx->cfg.packet_size);
             return -1;
         }
 
         rc = rte_eth_dev_set_mtu(ctx->cfg.port_id, desired_mtu);
         if (rc < 0) {
+            RTE_LOG(ERR, USER1,
+                    "receiver port=%" PRIu16 " set mtu failed: mtu=%" PRIu16
+                    " rc=%d err=%d(%s)\n",
+                    ctx->cfg.port_id, desired_mtu, rc, rte_errno, rte_strerror(rte_errno));
             return rc;
         }
     }
 
     rc = rte_eth_dev_start(ctx->cfg.port_id);
     if (rc < 0) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " start failed: rc=%d err=%d(%s)\n",
+                ctx->cfg.port_id, rc, rte_errno, rte_strerror(rte_errno));
         return rc;
     }
 
+    rte_eth_macaddr_get(ctx->cfg.port_id, &ctx->port_mac);
     return 0;
 }
 
@@ -260,41 +435,6 @@ static int init_vc_cbfc_states(receiver_ctx_t *ctx) {
     }
 
     return 0;
-}
-
-static void send_cbfc_feedback(receiver_ctx_t *ctx, const struct rte_ether_addr *dst_addr,
-                               uint32_t vc_id, uint64_t fccl) {
-    struct rte_mbuf *mbuf = NULL;
-    char *packet = NULL;
-    struct rte_ether_hdr *eth_hdr = NULL;
-    cbfc_feedback_header_t *fb_hdr = NULL;
-    struct rte_ether_addr src_mac;
-
-    mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
-    if (mbuf == NULL) {
-        return;
-    }
-
-    packet = rte_pktmbuf_append(mbuf, sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE);
-    if (packet == NULL) {
-        rte_pktmbuf_free(mbuf);
-        return;
-    }
-
-    eth_hdr = (struct rte_ether_hdr *)packet;
-    fb_hdr = (cbfc_feedback_header_t *)(packet + sizeof(*eth_hdr));
-
-    rte_eth_macaddr_get(ctx->cfg.port_id, &src_mac);
-    rte_ether_addr_copy(dst_addr, &eth_hdr->dst_addr);
-    rte_ether_addr_copy(&src_mac, &eth_hdr->src_addr);
-    eth_hdr->ether_type = rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE);
-
-    fb_hdr->vc_id = rte_cpu_to_be_32(vc_id);
-    fb_hdr->fccl = fc_cpu_to_be64(fccl);
-
-    if (rte_eth_tx_burst(ctx->cfg.port_id, ctx->cfg.tx_queue_id, &mbuf, 1) != 1U) {
-        rte_pktmbuf_free(mbuf);
-    }
 }
 
 static uint32_t flow_hash(uint32_t flow_id) {
@@ -427,6 +567,7 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     if (rc != 0) {
         return rc;
     }
+    ctx->rx_fc_data_pkts++;
 
     if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
         receiver_vc_cbfc_state_t *vc_state = NULL;
@@ -443,32 +584,24 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
         new_received = vc_state->received;
         fccl = vc_state->buffer_cap + vc_state->received;
         RTE_LOG(DEBUG, USER1,
-                "[CBFC][receiver][rx] vc=%" PRIu32 " flow=%" PRIu32
+                "[CBFC][receiver][rx] port=%" PRIu16 " vc=%" PRIu32 " flow=%" PRIu32
                 " buffer_cap=%" PRIu64 " old_received=%" PRIu64
                 " new_received=%" PRIu64 " fccl=%" PRIu64 "\n",
-                vc_id, flow_id, vc_state->buffer_cap, old_received, new_received, fccl);
-        send_cbfc_feedback(ctx, &eth_hdr->src_addr, vc_id, fccl);
+                ctx->cfg.port_id, vc_id, flow_id, vc_state->buffer_cap, old_received, new_received,
+                fccl);
+        receiver_feedback_try_enqueue(ctx, &eth_hdr->src_addr, vc_id, fccl);
     }
 
     return 0;
 }
 
-static int flush_flow_stats_to_csv(const receiver_ctx_t *ctx, uint64_t end_cycles) {
-    FILE *fp = NULL;
+static int append_flow_stats_csv(FILE *fp, const receiver_ctx_t *ctx, uint64_t end_cycles) {
     uint32_t i = 0;
-    double total_runtime_sec = 0.0;
+    double total_runtime_sec = (double)(end_cycles - ctx->start_cycles) / (double)ctx->hz;
 
-    fp = fopen(ctx->cfg.output_path, "w");
-    if (fp == NULL) {
-        return -1;
-    }
-
-    total_runtime_sec = (double)(end_cycles - ctx->start_cycles) / (double)ctx->hz;
     if (total_runtime_sec <= 0.0) {
         total_runtime_sec = 1.0 / (double)ctx->hz;
     }
-
-    fprintf(fp, "flow_id,timestamp_count,pps,bps,timestamps_sec\n");
 
     for (i = 0; i < ctx->records_cap; i++) {
         const flow_record_t *record = &ctx->records[i];
@@ -495,8 +628,8 @@ static int flush_flow_stats_to_csv(const receiver_ctx_t *ctx, uint64_t end_cycle
         pps = (double)record->pkt_count / duration_sec;
         bps = ((double)record->byte_count * 8.0) / duration_sec;
 
-        fprintf(fp, "%" PRIu32 ",%" PRIu32 ",%.6f,%.6f,\"", record->flow_id, record->ts_count,
-                pps, bps);
+        fprintf(fp, "%" PRIu16 ",%" PRIu32 ",%" PRIu32 ",%.6f,%.6f,\"", ctx->cfg.port_id,
+                record->flow_id, record->ts_count, pps, bps);
         for (j = 0; j < record->ts_count; j++) {
             double ts_sec = (double)(record->timestamps[j] - ctx->start_cycles) / (double)ctx->hz;
             fprintf(fp, "%.9f", ts_sec);
@@ -507,14 +640,86 @@ static int flush_flow_stats_to_csv(const receiver_ctx_t *ctx, uint64_t end_cycle
         fprintf(fp, "\"\n");
     }
 
+    return 0;
+}
+
+static int flush_all_flow_stats_to_csv(const receiver_app_t *app, uint64_t end_cycles) {
+    FILE *fp = NULL;
+    uint16_t i = 0;
+
+    fp = fopen(app->cfg.output_path, "w");
+    if (fp == NULL) {
+        return -1;
+    }
+
+    fprintf(fp, "port_id,flow_id,timestamp_count,pps,bps,timestamps_sec\n");
+    for (i = 0; i < app->cfg.nb_ports; i++) {
+        if (append_flow_stats_csv(fp, &app->port_ctxs[i], end_cycles) != 0) {
+            fclose(fp);
+            return -1;
+        }
+    }
+
     fclose(fp);
+    return 0;
+}
+
+static void receiver_run_rx_loop(receiver_ctx_t *ctx, uint16_t burst) {
+    struct rte_mbuf *rx_pkts[MAX_RX_BURST];
+
+    while (!g_force_quit) {
+        uint16_t nb_rx = rte_eth_rx_burst(ctx->cfg.port_id, ctx->cfg.rx_queue_id, rx_pkts, burst);
+        uint16_t i = 0;
+
+        if (nb_rx == 0U) {
+            continue;
+        }
+
+        for (i = 0; i < nb_rx; i++) {
+            if (process_one_packet(ctx, rx_pkts[i]) != 0) {
+                g_force_quit = 1;
+                break;
+            }
+        }
+
+        for (i = 0; i < nb_rx; i++) {
+            rte_pktmbuf_free(rx_pkts[i]);
+        }
+    }
+}
+
+static int receiver_rx_loop(void *arg) {
+    receiver_worker_arg_t *worker = (receiver_worker_arg_t *)arg;
+    receiver_ctx_t *ctx = &worker->app->port_ctxs[worker->port_idx];
+    uint16_t burst = (uint16_t)ctx->cfg.rx_burst_size;
+
+    if (burst > MAX_RX_BURST) {
+        burst = MAX_RX_BURST;
+    }
+
+    receiver_run_rx_loop(ctx, burst);
+    return 0;
+}
+
+static int receiver_feedback_loop(void *arg) {
+    receiver_worker_arg_t *worker = (receiver_worker_arg_t *)arg;
+    receiver_ctx_t *ctx = &worker->app->port_ctxs[worker->port_idx];
+
+    while (!g_force_quit) {
+        receiver_feedback_tx_run_tick(ctx);
+    }
+    while (receiver_feedback_tx_run_tick(ctx) > 0U) {
+    }
+
     return 0;
 }
 
 static void cleanup_receiver(receiver_ctx_t *ctx) {
     uint32_t i = 0;
 
-    if (rte_eth_dev_is_valid_port(ctx->cfg.port_id)) {
+    receiver_feedback_cleanup(ctx);
+
+    if (ctx->cfg.port_id != UINT16_MAX && rte_eth_dev_is_valid_port(ctx->cfg.port_id)) {
         rte_eth_dev_stop(ctx->cfg.port_id);
         rte_eth_dev_close(ctx->cfg.port_id);
     }
@@ -524,31 +729,132 @@ static void cleanup_receiver(receiver_ctx_t *ctx) {
             free(ctx->records[i].timestamps);
         }
         free(ctx->records);
+        ctx->records = NULL;
     }
 
     free(ctx->vc_cbfc_states);
+    ctx->vc_cbfc_states = NULL;
+
+    if (ctx->mbuf_pool != NULL) {
+        rte_mempool_free(ctx->mbuf_pool);
+        ctx->mbuf_pool = NULL;
+    }
+}
+
+static int init_receiver_port_ctx(receiver_ctx_t *ctx, const receiver_app_t *app, uint16_t port_idx) {
+    uint32_t data_room_size = 0;
+    int socket_id = 0;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->cfg.port_id = app->cfg.port_ids[port_idx];
+    ctx->cfg.rx_queue_id = 0;
+    ctx->cfg.tx_queue_id = 0;
+    ctx->cfg.rx_burst_size = app->cfg.rx_burst_size;
+    ctx->cfg.tx_burst_size = app->cfg.tx_burst_size;
+    ctx->cfg.nb_vc = app->cfg.nb_vc;
+    ctx->cfg.packet_size = app->cfg.packet_size;
+    ctx->cfg.mempool_size = app->cfg.mempool_size;
+    ctx->cfg.feedback_ring_size = app->cfg.feedback_ring_size;
+    ctx->cfg.cbfc_total_buffer_pkts = app->cfg.cbfc_total_buffer_pkts;
+    ctx->cfg.fc_mode = app->cfg.fc_mode;
+    ctx->hz = app->hz;
+    ctx->start_cycles = app->start_cycles;
+
+    snprintf(ctx->mempool_name, sizeof(ctx->mempool_name), "rxmp_p%u", ctx->cfg.port_id);
+    snprintf(ctx->feedback_ring_name, sizeof(ctx->feedback_ring_name), "rxfb_p%u",
+             ctx->cfg.port_id);
+    snprintf(ctx->feedback_free_ring_name, sizeof(ctx->feedback_free_ring_name), "rxff_p%u",
+             ctx->cfg.port_id);
+
+    data_room_size =
+        RTE_MAX(ctx->cfg.packet_size, (uint32_t)RTE_ETHER_MAX_LEN) + RTE_PKTMBUF_HEADROOM;
+    if (data_room_size > UINT16_MAX) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " data room too large: packet_size=%" PRIu32
+                " data_room=%" PRIu32 "\n",
+                ctx->cfg.port_id, ctx->cfg.packet_size, data_room_size);
+        return -1;
+    }
+
+    socket_id = rte_eth_dev_socket_id(ctx->cfg.port_id);
+    if (socket_id < 0) {
+        socket_id = rte_socket_id();
+    }
+
+    ctx->mbuf_pool =
+        rte_pktmbuf_pool_create(ctx->mempool_name, ctx->cfg.mempool_size, MBUF_CACHE_SIZE, 0,
+                                (uint16_t)data_room_size, socket_id);
+    if (ctx->mbuf_pool == NULL) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " mempool create failed: name=%s count=%" PRIu32
+                " data_room=%" PRIu32 " socket=%d err=%d(%s)\n",
+                ctx->cfg.port_id, ctx->mempool_name, ctx->cfg.mempool_size, data_room_size,
+                socket_id, rte_errno, rte_strerror(rte_errno));
+        return -1;
+    }
+
+    if (init_port(ctx) != 0) {
+        RTE_LOG(ERR, USER1, "receiver port=%" PRIu16 " init_port failed\n", ctx->cfg.port_id);
+        return -1;
+    }
+    if (flow_table_init(ctx) != 0) {
+        RTE_LOG(ERR, USER1, "receiver port=%" PRIu16 " flow table init failed\n",
+                ctx->cfg.port_id);
+        return -1;
+    }
+    if (init_vc_cbfc_states(ctx) != 0) {
+        RTE_LOG(ERR, USER1, "receiver port=%" PRIu16 " vc cbfc state init failed\n",
+                ctx->cfg.port_id);
+        return -1;
+    }
+    if (ctx->cfg.fc_mode == FC_MODE_CBFC && receiver_feedback_init(ctx) != 0) {
+        RTE_LOG(ERR, USER1,
+                "receiver port=%" PRIu16 " feedback init failed: ring_size=%" PRIu32 "\n",
+                ctx->cfg.port_id, ctx->cfg.feedback_ring_size);
+        return -1;
+    }
+
+    RTE_LOG(INFO, USER1,
+            "receiver port=%" PRIu16 " init ok: mempool=%s count=%" PRIu32
+            " packet_size=%" PRIu32 " fc_mode=%s\n",
+            ctx->cfg.port_id, ctx->mempool_name, ctx->cfg.mempool_size, ctx->cfg.packet_size,
+            ctx->cfg.fc_mode == FC_MODE_CBFC ? "cbfc" : "none");
+
+    return 0;
 }
 
 int main(int argc, char **argv) {
-    receiver_ctx_t ctx;
-    struct rte_mbuf *rx_pkts[MAX_RX_BURST];
-    uint32_t data_room_size = 0;
-    uint16_t burst = 0;
+    receiver_app_t app;
+    receiver_worker_arg_t *worker_args = NULL;
+    unsigned int *rx_lcores = NULL;
+    unsigned int *feedback_lcores = NULL;
+    unsigned int worker_ids[RTE_MAX_LCORE];
+    uint16_t nb_workers = 0;
+    uint16_t required_workers = 0;
+    uint16_t worker_cursor = 0;
+    uint16_t launched_rx = 0;
+    uint16_t launched_feedback = 0;
+    uint16_t i = 0;
+    unsigned int lcore_id = 0;
+    uint64_t total_rx_pkts = 0;
+    uint64_t total_feedback_tx_pkts = 0;
+    uint64_t total_feedback_drops = 0;
     int eal_argc = 0;
-    int rc = 0;
+    int ret = EXIT_FAILURE;
 
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.cfg.port_id = 0;
-    ctx.cfg.rx_queue_id = 0;
-    ctx.cfg.tx_queue_id = 0;
-    ctx.cfg.nb_vc = DEFAULT_NB_VC;
-    ctx.cfg.rx_burst_size = DEFAULT_RX_BURST;
-    ctx.cfg.tx_burst_size = DEFAULT_TX_BURST;
-    ctx.cfg.packet_size = DEFAULT_PKT_SIZE;
-    ctx.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
-    ctx.cfg.cbfc_total_buffer_pkts = DEFAULT_CBFC_TOTAL_BUFFER_PKTS;
-    ctx.cfg.fc_mode = FC_MODE_NONE;
-    ctx.cfg.output_path = DEFAULT_OUTPUT_PATH;
+    memset(&app, 0, sizeof(app));
+    if (parse_port_list(DEFAULT_PORTS, &app.cfg.port_ids, &app.cfg.nb_ports) != 0) {
+        rte_exit(EXIT_FAILURE, "default ports parse failed\n");
+    }
+    app.cfg.nb_vc = DEFAULT_NB_VC;
+    app.cfg.rx_burst_size = DEFAULT_RX_BURST;
+    app.cfg.tx_burst_size = DEFAULT_TX_BURST;
+    app.cfg.packet_size = DEFAULT_PKT_SIZE;
+    app.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
+    app.cfg.feedback_ring_size = DEFAULT_FEEDBACK_RING_SIZE;
+    app.cfg.cbfc_total_buffer_pkts = DEFAULT_CBFC_TOTAL_BUFFER_PKTS;
+    app.cfg.fc_mode = FC_MODE_NONE;
+    app.cfg.output_path = DEFAULT_OUTPUT_PATH;
 
     eal_argc = rte_eal_init(argc, argv);
     if (eal_argc < 0) {
@@ -560,71 +866,140 @@ int main(int argc, char **argv) {
     argv += eal_argc;
     optind = 1;
 
-    if (parse_app_args(argc, argv, &ctx.cfg) != 0) {
+    if (parse_app_args(argc, argv, &app.cfg) != 0) {
         usage("receiver");
         rte_exit(EXIT_FAILURE, "Invalid app arguments\n");
+    }
+    if (validate_app_config(&app.cfg) != 0) {
+        rte_exit(EXIT_FAILURE, "Invalid receiver port list or packet size\n");
     }
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    ctx.hz = rte_get_timer_hz();
-    ctx.start_cycles = rte_get_timer_cycles();
-
-    data_room_size = ctx.cfg.packet_size + RTE_PKTMBUF_HEADROOM;
-    if (data_room_size > UINT16_MAX) {
-        rte_exit(EXIT_FAILURE, "Packet size too large for mbuf data room\n");
+    app.hz = rte_get_timer_hz();
+    app.start_cycles = rte_get_timer_cycles();
+    app.port_ctxs = calloc(app.cfg.nb_ports, sizeof(*app.port_ctxs));
+    worker_args = calloc(app.cfg.nb_ports, sizeof(*worker_args));
+    rx_lcores = calloc(app.cfg.nb_ports, sizeof(*rx_lcores));
+    if (app.port_ctxs == NULL || worker_args == NULL || rx_lcores == NULL) {
+        fprintf(stderr, "receiver multi-port allocation failed\n");
+        goto out;
     }
-
-    ctx.mbuf_pool = rte_pktmbuf_pool_create("receiver_mbuf_pool", ctx.cfg.mempool_size,
-                                            MBUF_CACHE_SIZE, 0, (uint16_t)data_room_size,
-                                            rte_socket_id());
-    if (ctx.mbuf_pool == NULL) {
-        rte_exit(EXIT_FAILURE, "mempool create failed\n");
-    }
-
-    if (init_port(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "port init failed\n");
-    }
-
-    if (flow_table_init(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "flow table init failed\n");
-    }
-
-    if (init_vc_cbfc_states(&ctx) != 0) {
-        rte_exit(EXIT_FAILURE, "vc cbfc state init failed\n");
-    }
-
-    burst = (uint16_t)ctx.cfg.rx_burst_size;
-    if (burst > MAX_RX_BURST) {
-        burst = MAX_RX_BURST;
-    }
-
-    while (!g_force_quit) {
-        uint16_t nb_rx = rte_eth_rx_burst(ctx.cfg.port_id, ctx.cfg.rx_queue_id, rx_pkts, burst);
-        uint16_t i = 0;
-
-        if (nb_rx == 0U) {
-            continue;
+    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+        feedback_lcores = calloc(app.cfg.nb_ports, sizeof(*feedback_lcores));
+        if (feedback_lcores == NULL) {
+            fprintf(stderr, "receiver feedback lcore allocation failed\n");
+            goto out;
         }
+    }
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        app.port_ctxs[i].cfg.port_id = UINT16_MAX;
+    }
 
-        for (i = 0; i < nb_rx; i++) {
-            if (process_one_packet(&ctx, rx_pkts[i]) != 0) {
-                g_force_quit = 1;
-                break;
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        if (init_receiver_port_ctx(&app.port_ctxs[i], &app, i) != 0) {
+            fprintf(stderr, "init failed for receiver port=%u\n", app.cfg.port_ids[i]);
+            goto out;
+        }
+        worker_args[i].app = &app;
+        worker_args[i].port_idx = i;
+    }
+
+    RTE_LCORE_FOREACH_WORKER(lcore_id) {
+        if (nb_workers < RTE_DIM(worker_ids)) {
+            worker_ids[nb_workers++] = lcore_id;
+        }
+    }
+
+    required_workers = app.cfg.nb_ports;
+    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+        required_workers = (uint16_t)(required_workers + app.cfg.nb_ports);
+    }
+    if (nb_workers < required_workers) {
+        fprintf(stderr, "Need at least %u worker lcores for %u receiver ports in %s mode\n",
+                required_workers, app.cfg.nb_ports,
+                app.cfg.fc_mode == FC_MODE_CBFC ? "cbfc" : "normal");
+        goto out;
+    }
+
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        rx_lcores[i] = worker_ids[worker_cursor++];
+    }
+    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+        for (i = 0; i < app.cfg.nb_ports; i++) {
+            feedback_lcores[i] = worker_ids[worker_cursor++];
+        }
+    }
+
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        if (rte_eal_remote_launch(receiver_rx_loop, &worker_args[i], rx_lcores[i]) != 0) {
+            fprintf(stderr, "failed to launch receiver RX loop on lcore %u\n", rx_lcores[i]);
+            goto out;
+        }
+        launched_rx++;
+    }
+    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+        for (i = 0; i < app.cfg.nb_ports; i++) {
+            if (rte_eal_remote_launch(receiver_feedback_loop, &worker_args[i], feedback_lcores[i]) !=
+                0) {
+                fprintf(stderr, "failed to launch receiver feedback loop on lcore %u\n",
+                        feedback_lcores[i]);
+                goto out;
             }
-        }
-
-        for (i = 0; i < nb_rx; i++) {
-            rte_pktmbuf_free(rx_pkts[i]);
+            launched_feedback++;
         }
     }
 
-    rc = flush_flow_stats_to_csv(&ctx, rte_get_timer_cycles());
-    if (rc != 0) {
-        fprintf(stderr, "failed to write output CSV: %s\n", ctx.cfg.output_path);
+    for (i = 0; i < launched_rx; i++) {
+        rte_eal_wait_lcore(rx_lcores[i]);
+    }
+    launched_rx = 0;
+    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+        for (i = 0; i < launched_feedback; i++) {
+            rte_eal_wait_lcore(feedback_lcores[i]);
+        }
+        launched_feedback = 0;
     }
 
-    cleanup_receiver(&ctx);
-    return rc == 0 ? 0 : 1;
+    if (flush_all_flow_stats_to_csv(&app, rte_get_timer_cycles()) != 0) {
+        fprintf(stderr, "failed to write output CSV: %s\n", app.cfg.output_path);
+        goto out;
+    }
+
+    for (i = 0; i < app.cfg.nb_ports; i++) {
+        total_rx_pkts += app.port_ctxs[i].rx_fc_data_pkts;
+        total_feedback_tx_pkts += app.port_ctxs[i].tx_cbfc_feedback_pkts;
+        total_feedback_drops += app.port_ctxs[i].feedback_enqueue_drop;
+        RTE_LOG(INFO, USER1,
+                "receiver port=%" PRIu16 " exit: received FC data packets=%" PRIu64
+                ", sent CBFC feedback packets=%" PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
+                app.port_ctxs[i].cfg.port_id, app.port_ctxs[i].rx_fc_data_pkts,
+                app.port_ctxs[i].tx_cbfc_feedback_pkts, app.port_ctxs[i].feedback_enqueue_drop);
+    }
+    RTE_LOG(INFO, USER1,
+            "receiver total exit: ports=%" PRIu16 ", received FC data packets=%" PRIu64
+            ", sent CBFC feedback packets=%" PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
+            app.cfg.nb_ports, total_rx_pkts, total_feedback_tx_pkts, total_feedback_drops);
+    ret = EXIT_SUCCESS;
+
+out:
+    g_force_quit = 1;
+    for (i = 0; i < launched_rx; i++) {
+        rte_eal_wait_lcore(rx_lcores[i]);
+    }
+    for (i = 0; i < launched_feedback; i++) {
+        rte_eal_wait_lcore(feedback_lcores[i]);
+    }
+    if (app.port_ctxs != NULL) {
+        for (i = 0; i < app.cfg.nb_ports; i++) {
+            cleanup_receiver(&app.port_ctxs[i]);
+        }
+    }
+    free(feedback_lcores);
+    free(rx_lcores);
+    free(worker_args);
+    free(app.port_ctxs);
+    free_app_config(&app.cfg);
+    return ret;
 }

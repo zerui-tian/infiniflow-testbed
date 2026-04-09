@@ -1,12 +1,15 @@
 #include "switch/switch_ctx.h"
 #include "core/fc_header.h"
 
+#include <inttypes.h>
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
+#include <rte_log.h>
 #include <rte_mbuf.h>
 
 uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx) {
+    static bool g_feedback_rx_port_logged = false;
     struct rte_mbuf *rx_pkts[256];
     uint16_t burst = (ctx->cfg.rx_burst_size > 256U) ? 256U : (uint16_t)ctx->cfg.rx_burst_size;
     uint16_t nb_rx = 0;
@@ -16,6 +19,10 @@ uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx) {
     nb_rx = rte_eth_rx_burst(ctx->cfg.egress_port, ctx->cfg.egress_rx_queue_id, rx_pkts, burst);
     if (nb_rx == 0U) {
         return 0;
+    }
+    if (!g_feedback_rx_port_logged) {
+        RTE_LOG(INFO, USER1, "switch: feedback RX on egress port %" PRIu16 "\n", ctx->cfg.egress_port);
+        g_feedback_rx_port_logged = true;
     }
 
     for (i = 0; i < nb_rx; i++) {
@@ -41,7 +48,6 @@ uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx) {
         if (vc_id < ctx->cfg.nb_vc && ctx->fc_ops != NULL && ctx->fc_ops->on_feedback_rx != NULL) {
             fccl = fc_be64_to_cpu(fb_hdr->fccl);
             ctx->fc_ops->on_feedback_rx(ctx, vc_id, fccl);
-            ctx->total_feedback_rx++;
             processed++;
         }
 

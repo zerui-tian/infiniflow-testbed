@@ -51,6 +51,8 @@ uint32_t sender_feedback_rx_run_tick(sender_ctx_t *ctx) {
         {
             sender_vc_fc_state_t *vc_state = &ctx->vc_fc_states[vc_id];
             uint64_t old_fccl = __atomic_load_n(&vc_state->fccl, __ATOMIC_RELAXED);
+            if(old_fccl >= fccl)
+                continue;
             uint64_t fctbs = __atomic_load_n(&vc_state->fctbs, __ATOMIC_RELAXED);
             uint64_t old_credit = (old_fccl > fctbs) ? (old_fccl - fctbs) : 0U;
             uint64_t new_credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
@@ -62,6 +64,7 @@ uint32_t sender_feedback_rx_run_tick(sender_ctx_t *ctx) {
                     vc_id, old_fccl, fccl, fctbs, old_credit, new_credit);
         }
         __atomic_store_n(&ctx->vc_fc_states[vc_id].fccl, fccl, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&ctx->feedback_rx_pkts[vc_id], 1U, __ATOMIC_RELAXED);
         processed++;
     }
 

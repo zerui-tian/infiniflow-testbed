@@ -1,13 +1,11 @@
 #include "sender/sender_ctx.h"
 #include "core/fc_header.h"
 
-#include <inttypes.h>
 #include <string.h>
 
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
-#include <rte_log.h>
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
@@ -38,21 +36,6 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
         if (flow->vc >= ctx->cfg.nb_vc) {
             flow->state = FLOW_STATE_DEAD;
             continue;
-        }
-
-        if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
-            sender_vc_fc_state_t *fc_state = &ctx->vc_fc_states[flow->vc];
-            uint64_t fccl = __atomic_load_n(&fc_state->fccl, __ATOMIC_ACQUIRE);
-            uint64_t fctbs = __atomic_load_n(&fc_state->fctbs, __ATOMIC_RELAXED);
-            uint64_t credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
-
-            if (fccl <= fctbs) {
-                // RTE_LOG(DEBUG, USER1,
-                //         "[CBFC][sender][tx-block] vc=%" PRIu32 " flow=%" PRIu32
-                //         " fccl=%" PRIu64 " fctbs=%" PRIu64 " credit=%" PRIu64 "\n",
-                //         flow->vc, flow->fid, fccl, fctbs, credit);
-                continue;
-            }
         }
 
         q = &ctx->vc_queues[flow->vc];
@@ -89,18 +72,6 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
         }
 
         flow->sent_count++;
-        if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
-            sender_vc_fc_state_t *fc_state = &ctx->vc_fc_states[flow->vc];
-            uint64_t old_fctbs = __atomic_fetch_add(&fc_state->fctbs, 1U, __ATOMIC_RELAXED);
-            uint64_t new_fctbs = old_fctbs + 1U;
-            uint64_t fccl = __atomic_load_n(&fc_state->fccl, __ATOMIC_ACQUIRE);
-            uint64_t credit = (fccl > new_fctbs) ? (fccl - new_fctbs) : 0U;
-
-            RTE_LOG(DEBUG, USER1,
-                    "[CBFC][sender][tx] vc=%" PRIu32 " flow=%" PRIu32
-                    " fccl=%" PRIu64 " fctbs=%" PRIu64 " credit=%" PRIu64 "\n",
-                    flow->vc, flow->fid, fccl, new_fctbs, credit);
-        }
         enqueued++;
         ctx->total_pkts_enqueued++;
 
