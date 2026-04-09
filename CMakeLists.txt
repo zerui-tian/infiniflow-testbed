@@ -44,6 +44,7 @@ add_executable(receiver
     src/core/fc_header.h
     src/receiver/receiver_ctx.h
     src/receiver/main.c
+    src/receiver/feedback_tx.c
 )
 
 target_include_directories(receiver PRIVATE
@@ -67,6 +68,7 @@ add_executable(switch
     src/core/vc_ring.h
     src/switch/switch_ctx.h
     src/switch/main.c
+    src/switch/route_table.c
     src/switch/scheduler.c
     src/switch/forward.c
     src/switch/feedback_gen.c

@@ -47,6 +47,7 @@ typedef struct sender_ctx_s {
 
     vc_queue_t *vc_queues;
     sender_vc_fc_state_t *vc_fc_states;
+    uint64_t *feedback_rx_pkts;
 
     struct rte_mempool *mbuf_pool;
 

@@ -45,6 +45,8 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             const fc_data_header_t *fc_hdr = NULL;
             uint32_t vc_id = 0;
             switch_vc_fc_state_t *vc_state = NULL;
+            switch_vc_stats_t *vc_stats = NULL;
+            size_t stats_idx = 0;
 
             if (mbuf->pkt_len < sizeof(*eth_hdr) + FC_DATA_HEADER_SIZE) {
                 rte_pktmbuf_free(mbuf);
@@ -57,42 +59,26 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
                 rte_pktmbuf_free(mbuf);
                 continue;
             }
+
+            stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + vc_id;
+            vc_stats = &ctx->vc_stats[stats_idx];
+            __atomic_fetch_add(&vc_stats->rx_pkts, 1U, __ATOMIC_RELAXED);
+
             vc_state = &ctx->vc_states[vc_id];
             if (try_reserve_vc_slot(vc_state) != 0) {
                 rte_pktmbuf_free(mbuf);
+                __atomic_fetch_add(&vc_stats->drop_capacity_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
             if (rte_ring_mp_enqueue(ctx->vc_queues[vc_id].ring, mbuf) != 0) {
                 __atomic_fetch_sub(&vc_state->occupancy, 1U, __ATOMIC_RELAXED);
                 rte_pktmbuf_free(mbuf);
+                __atomic_fetch_add(&vc_stats->drop_other_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
-            ctx->total_data_rx++;
-            ctx->total_enqueued++;
             enqueued++;
-            continue;
-        }
-
-        if (eth_hdr->ether_type == rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE)) {
-            const cbfc_feedback_header_t *fb_hdr = NULL;
-            uint32_t vc_id = 0;
-            uint64_t fccl = 0;
-
-            if (mbuf->pkt_len < sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE) {
-                rte_pktmbuf_free(mbuf);
-                continue;
-            }
-
-            fb_hdr = (const cbfc_feedback_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
-            vc_id = rte_be_to_cpu_32(fb_hdr->vc_id);
-            if (vc_id < ctx->cfg.nb_vc && ctx->fc_ops != NULL && ctx->fc_ops->on_feedback_rx != NULL) {
-                fccl = fc_be64_to_cpu(fb_hdr->fccl);
-                ctx->fc_ops->on_feedback_rx(ctx, vc_id, fccl);
-                ctx->total_feedback_rx++;
-            }
-            rte_pktmbuf_free(mbuf);
             continue;
         }
 

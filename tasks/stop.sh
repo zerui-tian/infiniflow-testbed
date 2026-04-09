@@ -19,6 +19,11 @@ source "${STATE_PATH}"
 
 STOP_GRACE_SEC="${STOP_GRACE_SEC:-3}"
 
+id_to_token() {
+  local raw="$1"
+  echo "${raw}" | tr '[:lower:]-' '[:upper:]_' | tr -c 'A-Z0-9_' '_'
+}
+
 stop_one() {
   local name="$1"
   local host="$2"
@@ -57,10 +62,30 @@ stop_one() {
 
 log_info "run_id=${RUN_ID:-unknown}"
 log_info "state=${STATE_PATH}"
-log_info "stop order: sender -> receiver -> switch"
+log_info "stop order: senders -> receivers -> switch"
 
-stop_one "sender" "${HOST_SENDER}" "${SENDER_PID}"
-stop_one "receiver" "${HOST_RECEIVER}" "${RECEIVER_PID}"
+if [[ -n "${SENDER_IDS:-}" ]]; then
+  for sender_id in ${SENDER_IDS}; do
+    sender_tok="$(id_to_token "${sender_id}")"
+    sender_host_var="SENDER_${sender_tok}_HOST"
+    sender_pid_var="SENDER_${sender_tok}_PID"
+    stop_one "sender(${sender_id})" "${!sender_host_var}" "${!sender_pid_var}"
+  done
+elif [[ -n "${HOST_SENDER:-}" && -n "${SENDER_PID:-}" ]]; then
+  stop_one "sender" "${HOST_SENDER}" "${SENDER_PID}"
+fi
+
+if [[ -n "${RECEIVER_IDS:-}" ]]; then
+  for receiver_id in ${RECEIVER_IDS}; do
+    receiver_tok="$(id_to_token "${receiver_id}")"
+    receiver_host_var="RECEIVER_${receiver_tok}_HOST"
+    receiver_pid_var="RECEIVER_${receiver_tok}_PID"
+    stop_one "receiver(${receiver_id})" "${!receiver_host_var}" "${!receiver_pid_var}"
+  done
+elif [[ -n "${HOST_RECEIVER:-}" && -n "${RECEIVER_PID:-}" ]]; then
+  stop_one "receiver" "${HOST_RECEIVER}" "${RECEIVER_PID}"
+fi
+
 stop_one "switch" "${HOST_SWITCH}" "${SWITCH_PID}"
 
 log_info "all components stopped"

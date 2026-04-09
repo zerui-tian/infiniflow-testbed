@@ -18,7 +18,7 @@
 #include <rte_ring.h>
 
 #define DEFAULT_INGRESS_PORTS "0,1"
-#define DEFAULT_EGRESS_PORT 2U
+#define DEFAULT_EGRESS_PORTS "2"
 #define DEFAULT_NB_VC 8U
 #define DEFAULT_VC_RING_SIZE 1024U
 #define DEFAULT_FEEDBACK_RING_SIZE 1024U
@@ -28,7 +28,6 @@
 #define DEFAULT_RX_BURST 64U
 #define DEFAULT_INITIAL_FCCL 1024U
 #define DEFAULT_VC_CAPACITY 1024U
-#define DEFAULT_FLOW_MAP_CAPACITY 1024U
 #define MBUF_CACHE_SIZE 256U
 
 static volatile sig_atomic_t g_force_quit = 0;
@@ -105,7 +104,23 @@ static int parse_fc_mode(const char *s, fc_mode_t *mode) {
     return -1;
 }
 
-static int parse_ingress_ports(const char *spec, switch_config_t *cfg) {
+static int copy_string_field(const char *src, char *dst, size_t dst_len) {
+    size_t src_len = 0;
+
+    if (src == NULL || dst == NULL || dst_len == 0U) {
+        return -1;
+    }
+
+    src_len = strlen(src);
+    if (src_len >= dst_len) {
+        return -1;
+    }
+
+    memcpy(dst, src, src_len + 1U);
+    return 0;
+}
+
+static int parse_port_list(const char *spec, uint16_t *ports, uint16_t max_ports, uint16_t *count_out) {
     char *dup = NULL;
     char *saveptr = NULL;
     char *token = NULL;
@@ -121,7 +136,7 @@ static int parse_ingress_ports(const char *spec, switch_config_t *cfg) {
         uint16_t port_id = 0;
         uint16_t i = 0;
 
-        if (count >= SWITCH_MAX_INGRESS_PORTS) {
+        if (count >= max_ports) {
             free(dup);
             return -1;
         }
@@ -130,25 +145,33 @@ static int parse_ingress_ports(const char *spec, switch_config_t *cfg) {
             return -1;
         }
         for (i = 0; i < count; i++) {
-            if (cfg->ingress_ports[i] == port_id) {
+            if (ports[i] == port_id) {
                 free(dup);
                 return -1;
             }
         }
-        cfg->ingress_ports[count++] = port_id;
+        ports[count++] = port_id;
         token = strtok_r(NULL, ",", &saveptr);
     }
 
     free(dup);
-    cfg->nb_ingress_ports = count;
+    *count_out = count;
     return count == 0U ? -1 : 0;
+}
+
+static int parse_ingress_ports(const char *spec, switch_config_t *cfg) {
+    return parse_port_list(spec, cfg->ingress_ports, SWITCH_MAX_INGRESS_PORTS, &cfg->nb_ingress_ports);
+}
+
+static int parse_egress_ports(const char *spec, switch_config_t *cfg) {
+    return parse_port_list(spec, cfg->egress_ports, SWITCH_MAX_EGRESS_PORTS, &cfg->nb_egress_ports);
 }
 
 static void usage(const char *prog) {
     printf("Usage: %s [EAL args] -- [options]\n", prog);
     printf("Options:\n");
     printf("  --ingress-ports <a,b>   Ingress port list (default: %s)\n", DEFAULT_INGRESS_PORTS);
-    printf("  --egress-port <id>      Egress port id (default: %u)\n", DEFAULT_EGRESS_PORT);
+    printf("  --egress-ports <a,b>    Egress port list (default: %s)\n", DEFAULT_EGRESS_PORTS);
     printf("  --vcs <num>             Number of shared VCs (default: %u)\n", DEFAULT_NB_VC);
     printf("  --vc-ring-size <num>    VC ring size (default: %u)\n", DEFAULT_VC_RING_SIZE);
     printf("  --feedback-ring-size <num> Per-ingress feedback ring size (default: %u)\n",
@@ -161,13 +184,14 @@ static void usage(const char *prog) {
     printf("  --initial-fccl <num>    Initial FCCL per VC (default: %u)\n", DEFAULT_INITIAL_FCCL);
     printf("  --vc-capacity <num>     Fixed VC capacity in packets (default: %u)\n",
            DEFAULT_VC_CAPACITY);
-    printf("  --flow-map <spec>       Static flow map flow:port,... (optional)\n");
+    printf("  --route-csv <path>      Route CSV with fid,port columns (required)\n");
 }
 
 static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
     static const struct option long_opts[] = {
         {"ingress-ports", required_argument, 0, 'i'},
-        {"egress-port", required_argument, 0, 'e'},
+        {"egress-ports", required_argument, 0, 'e'},
+        {"egress-port", required_argument, 0, 'o'},
         {"vcs", required_argument, 0, 'v'},
         {"vc-ring-size", required_argument, 0, 'r'},
         {"feedback-ring-size", required_argument, 0, 'q'},
@@ -178,12 +202,12 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
         {"fc-mode", required_argument, 0, 'f'},
         {"initial-fccl", required_argument, 0, 'c'},
         {"vc-capacity", required_argument, 0, 'k'},
-        {"flow-map", required_argument, 0, 'M'},
+        {"route-csv", required_argument, 0, 'p'},
         {0, 0, 0, 0},
     };
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "i:e:v:r:q:s:m:b:x:f:c:k:M:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:e:o:v:r:q:s:m:b:x:f:c:k:p:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'i':
                 if (parse_ingress_ports(optarg, cfg) != 0) {
@@ -191,7 +215,12 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
                 }
                 break;
             case 'e':
-                if (parse_u16(optarg, &cfg->egress_port) != 0) {
+                if (parse_egress_ports(optarg, cfg) != 0) {
+                    return -1;
+                }
+                break;
+            case 'o':
+                if (parse_egress_ports(optarg, cfg) != 0) {
                     return -1;
                 }
                 break;
@@ -245,8 +274,10 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
                     return -1;
                 }
                 break;
-            case 'M':
-                cfg->flow_map_spec = optarg;
+            case 'p':
+                if (copy_string_field(optarg, cfg->route_csv_path, sizeof(cfg->route_csv_path)) != 0) {
+                    return -1;
+                }
                 break;
             default:
                 return -1;
@@ -255,7 +286,8 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
 
     if (cfg->nb_ingress_ports == 0U || cfg->nb_vc == 0U || cfg->vc_ring_size == 0U ||
         cfg->feedback_ring_size == 0U || cfg->packet_size == 0U || cfg->mempool_size == 0U ||
-        cfg->tx_burst_size == 0U || cfg->rx_burst_size == 0U || cfg->vc_capacity_pkts == 0U) {
+        cfg->tx_burst_size == 0U || cfg->rx_burst_size == 0U || cfg->vc_capacity_pkts == 0U ||
+        cfg->nb_egress_ports == 0U || cfg->route_csv_path[0] == '\0') {
         return -1;
     }
 
@@ -264,9 +296,13 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
 
 static int validate_roles(const switch_config_t *cfg) {
     uint16_t i = 0;
+    uint16_t j = 0;
+
     for (i = 0; i < cfg->nb_ingress_ports; i++) {
-        if (cfg->ingress_ports[i] == cfg->egress_port) {
-            return -1;
+        for (j = 0; j < cfg->nb_egress_ports; j++) {
+            if (cfg->ingress_ports[i] == cfg->egress_ports[j]) {
+                return -1;
+            }
         }
     }
     return 0;
@@ -351,6 +387,8 @@ static int init_vc_rings(switch_ctx_t *ctx) {
 static int init_feedback_queues(switch_ctx_t *ctx) {
     uint16_t i = 0;
     uint32_t j = 0;
+    unsigned int feedback_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
+    unsigned int feedback_free_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
 
     ctx->feedback_queues = calloc(ctx->cfg.nb_ingress_ports, sizeof(*ctx->feedback_queues));
     ctx->feedback_free_queues =
@@ -371,11 +409,10 @@ static int init_feedback_queues(switch_ctx_t *ctx) {
 
         snprintf(ring_name, sizeof(ring_name), "switch_feedback_ring_%u", i);
         snprintf(free_ring_name, sizeof(free_ring_name), "switch_feedback_free_ring_%u", i);
-        ctx->feedback_queues[i] = rte_ring_create(ring_name, ctx->cfg.feedback_ring_size, rte_socket_id(),
-                                                  RING_F_SP_ENQ | RING_F_SC_DEQ);
-        ctx->feedback_free_queues[i] =
-            rte_ring_create(free_ring_name, ctx->cfg.feedback_ring_size, rte_socket_id(),
-                            RING_F_SP_ENQ | RING_F_SC_DEQ);
+        ctx->feedback_queues[i] = rte_ring_create(ring_name, ctx->cfg.feedback_ring_size,
+                                                  rte_socket_id(), feedback_ring_flags);
+        ctx->feedback_free_queues[i] = rte_ring_create(free_ring_name, ctx->cfg.feedback_ring_size,
+                                                       rte_socket_id(), feedback_free_ring_flags);
         if (ctx->feedback_queues[i] == NULL || ctx->feedback_free_queues[i] == NULL) {
             return -1;
         }
@@ -383,7 +420,7 @@ static int init_feedback_queues(switch_ctx_t *ctx) {
         for (j = 0; j < ctx->cfg.feedback_ring_size; j++) {
             switch_feedback_msg_t *msg =
                 &ctx->feedback_pool[(size_t)i * ctx->cfg.feedback_ring_size + j];
-            if (rte_ring_sp_enqueue(ctx->feedback_free_queues[i], msg) != 0) {
+            if (rte_ring_mp_enqueue(ctx->feedback_free_queues[i], msg) != 0) {
                 return -1;
             }
         }
@@ -410,104 +447,23 @@ static int init_vc_states(switch_ctx_t *ctx) {
     return 0;
 }
 
-static uint32_t flow_hash(uint32_t flow_id) {
-    return flow_id * 2654435761U;
-}
+static int init_vc_stats(switch_ctx_t *ctx) {
+    size_t nb_stats = (size_t)ctx->cfg.nb_ingress_ports * ctx->cfg.nb_vc;
 
-int switch_flow_map_init(switch_ctx_t *ctx) {
-    uint32_t cap = 1U;
-
-    while (cap < ctx->cfg.flow_map_capacity) {
-        cap <<= 1;
-    }
-    ctx->flow_map_entries = calloc(cap, sizeof(*ctx->flow_map_entries));
-    if (ctx->flow_map_entries == NULL) {
+    ctx->vc_stats = calloc(nb_stats, sizeof(*ctx->vc_stats));
+    if (ctx->vc_stats == NULL) {
         return -1;
     }
-    ctx->flow_map_mask = cap - 1U;
+
     return 0;
 }
 
-void switch_flow_map_free(switch_ctx_t *ctx) {
-    free(ctx->flow_map_entries);
-    ctx->flow_map_entries = NULL;
-    ctx->flow_map_mask = 0U;
-}
-
-int switch_flow_map_insert(switch_ctx_t *ctx, uint32_t flow_id, uint16_t egress_port) {
-    uint32_t idx = flow_hash(flow_id) & ctx->flow_map_mask;
-    uint32_t i = 0;
-
-    for (i = 0; i <= ctx->flow_map_mask; i++) {
-        switch_flow_map_entry_t *entry = &ctx->flow_map_entries[idx];
-        if (!entry->used || entry->flow_id == flow_id) {
-            entry->used = true;
-            entry->flow_id = flow_id;
-            entry->egress_port = egress_port;
-            return 0;
-        }
-        idx = (idx + 1U) & ctx->flow_map_mask;
-    }
-
-    return -1;
-}
-
-uint16_t switch_flow_map_lookup(const switch_ctx_t *ctx, uint32_t flow_id) {
-    uint32_t idx = flow_hash(flow_id) & ctx->flow_map_mask;
-    uint32_t i = 0;
-
-    for (i = 0; i <= ctx->flow_map_mask; i++) {
-        const switch_flow_map_entry_t *entry = &ctx->flow_map_entries[idx];
-        if (!entry->used) {
-            break;
-        }
-        if (entry->flow_id == flow_id) {
-            return entry->egress_port;
-        }
-        idx = (idx + 1U) & ctx->flow_map_mask;
-    }
-
-    return ctx->cfg.default_egress_port;
-}
-
-static int parse_flow_map_spec(switch_ctx_t *ctx, const char *spec) {
-    char *dup = NULL;
-    char *saveptr = NULL;
-    char *token = NULL;
-
-    if (spec == NULL || *spec == '\0') {
-        return 0;
-    }
-
-    dup = strdup(spec);
-    if (dup == NULL) {
+static int init_feedback_stats(switch_ctx_t *ctx) {
+    ctx->feedback_stats = calloc(ctx->cfg.nb_ingress_ports, sizeof(*ctx->feedback_stats));
+    if (ctx->feedback_stats == NULL) {
         return -1;
     }
 
-    token = strtok_r(dup, ",", &saveptr);
-    while (token != NULL) {
-        char *sep = strchr(token, ':');
-        uint32_t flow_id = 0;
-        uint16_t port_id = 0;
-
-        if (sep == NULL) {
-            free(dup);
-            return -1;
-        }
-        *sep = '\0';
-        if (parse_u32(token, &flow_id) != 0 || parse_u16(sep + 1, &port_id) != 0) {
-            free(dup);
-            return -1;
-        }
-        if (switch_flow_map_insert(ctx, flow_id, port_id) != 0) {
-            free(dup);
-            return -1;
-        }
-
-        token = strtok_r(NULL, ",", &saveptr);
-    }
-
-    free(dup);
     return 0;
 }
 
@@ -621,13 +577,17 @@ static void cleanup_switch(switch_ctx_t *ctx) {
             rte_eth_dev_close(ctx->cfg.ingress_ports[ingress_idx]);
         }
     }
-    if (rte_eth_dev_is_valid_port(ctx->cfg.egress_port)) {
-        rte_eth_dev_stop(ctx->cfg.egress_port);
-        rte_eth_dev_close(ctx->cfg.egress_port);
+    for (ingress_idx = 0; ingress_idx < ctx->cfg.nb_egress_ports; ingress_idx++) {
+        if (rte_eth_dev_is_valid_port(ctx->cfg.egress_ports[ingress_idx])) {
+            rte_eth_dev_stop(ctx->cfg.egress_ports[ingress_idx]);
+            rte_eth_dev_close(ctx->cfg.egress_ports[ingress_idx]);
+        }
     }
 
-    switch_flow_map_free(ctx);
+    switch_route_table_reset(ctx);
     free(ctx->feedback_pool);
+    free(ctx->feedback_stats);
+    free(ctx->vc_stats);
     free(ctx->vc_states);
     free(ctx->feedback_queues);
     free(ctx->feedback_free_queues);
@@ -659,15 +619,15 @@ int main(int argc, char **argv) {
     ctx.cfg.initial_fccl = DEFAULT_INITIAL_FCCL;
     ctx.cfg.vc_capacity_pkts = DEFAULT_VC_CAPACITY;
     ctx.cfg.fc_mode = FC_MODE_CBFC;
-    ctx.cfg.flow_map_capacity = DEFAULT_FLOW_MAP_CAPACITY;
-    ctx.cfg.default_egress_port = DEFAULT_EGRESS_PORT;
-    ctx.cfg.egress_port = DEFAULT_EGRESS_PORT;
     ctx.cfg.ingress_rx_queue_id = 0;
     ctx.cfg.ingress_tx_queue_id = 0;
     ctx.cfg.egress_rx_queue_id = 0;
     ctx.cfg.egress_tx_queue_id = 0;
     if (parse_ingress_ports(DEFAULT_INGRESS_PORTS, &ctx.cfg) != 0) {
         rte_exit(EXIT_FAILURE, "default ingress ports parse failed\n");
+    }
+    if (parse_egress_ports(DEFAULT_EGRESS_PORTS, &ctx.cfg) != 0) {
+        rte_exit(EXIT_FAILURE, "default egress ports parse failed\n");
     }
 
     eal_argc = rte_eal_init(argc, argv);
@@ -684,9 +644,11 @@ int main(int argc, char **argv) {
         usage("switch");
         rte_exit(EXIT_FAILURE, "Invalid app arguments\n");
     }
-    ctx.cfg.default_egress_port = ctx.cfg.egress_port;
     if (validate_roles(&ctx.cfg) != 0) {
-        rte_exit(EXIT_FAILURE, "egress port cannot overlap ingress ports\n");
+        rte_exit(EXIT_FAILURE, "egress ports cannot overlap ingress ports\n");
+    }
+    if (switch_route_table_load(&ctx) != 0) {
+        rte_exit(EXIT_FAILURE, "route csv load failed\n");
     }
 
     signal(SIGINT, handle_signal);
@@ -712,19 +674,24 @@ int main(int argc, char **argv) {
         if (rc != 0) {
             rte_exit(EXIT_FAILURE, "ingress port init failed\n");
         }
+        RTE_LOG(INFO, USER1, "switch: ingress port %" PRIu16 " started\n",
+                ctx.cfg.ingress_ports[ingress_idx]);
     }
-    rc = init_port(ctx.cfg.egress_port, ctx.cfg.egress_rx_queue_id, ctx.cfg.egress_tx_queue_id,
-                   ctx.mbuf_pool, ctx.cfg.packet_size);
-    if (rc != 0) {
-        rte_exit(EXIT_FAILURE, "egress port init failed\n");
+    for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_egress_ports; ingress_idx++) {
+        uint16_t egress_port = ctx.cfg.egress_ports[ingress_idx];
+
+        rc = init_port(egress_port, ctx.cfg.egress_rx_queue_id, ctx.cfg.egress_tx_queue_id,
+                       ctx.mbuf_pool, ctx.cfg.packet_size);
+        if (rc != 0) {
+            rte_exit(EXIT_FAILURE, "egress port init failed\n");
+        }
+        rte_eth_macaddr_get(egress_port, &ctx.egress_macs[ingress_idx]);
+        RTE_LOG(INFO, USER1, "switch: egress port %" PRIu16 " started\n", egress_port);
     }
 
-    if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0) {
+    if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0 ||
+        init_vc_stats(&ctx) != 0 || init_feedback_stats(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "switch queue/state init failed\n");
-    }
-
-    if (switch_flow_map_init(&ctx) != 0 || parse_flow_map_spec(&ctx, ctx.cfg.flow_map_spec) != 0) {
-        rte_exit(EXIT_FAILURE, "switch flow map init failed\n");
     }
 
     if (ctx.cfg.fc_mode == FC_MODE_CBFC) {
@@ -786,11 +753,37 @@ int main(int argc, char **argv) {
     rte_eal_wait_lcore(forward_lcore);
     rte_eal_wait_lcore(handler_lcore);
 
-    printf("Switch completed. data-rx=%" PRIu64 " feedback-rx=%" PRIu64 " enqueued=%" PRIu64
-           " tx-ok=%" PRIu64 " tx-drop=%" PRIu64 " feedback-gen=%" PRIu64 " feedback-sent=%" PRIu64
-           "\n",
-           ctx.total_data_rx, ctx.total_feedback_rx, ctx.total_enqueued, ctx.total_tx_ok,
-           ctx.total_tx_drop, ctx.total_feedback_generated, ctx.total_feedback_sent);
+    printf("Switch completed.\n");
+
+    for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
+        uint16_t port_id = ctx.cfg.ingress_ports[ingress_idx];
+        uint32_t vc_id = 0;
+        const switch_feedback_stats_t *fb_stats = &ctx.feedback_stats[ingress_idx];
+
+        for (vc_id = 0; vc_id < ctx.cfg.nb_vc; vc_id++) {
+            size_t stats_idx = (size_t)ingress_idx * ctx.cfg.nb_vc + vc_id;
+            const switch_vc_stats_t *stats = &ctx.vc_stats[stats_idx];
+
+            printf(
+                "switch ingress port %" PRIu16 " vc=%" PRIu32
+                ": rx=%" PRIu64 " tx-ok=%" PRIu64 " drop-capacity=%" PRIu64 " drop-other=%" PRIu64 "\n",
+                port_id, vc_id, stats->rx_pkts, stats->tx_ok_pkts, stats->drop_capacity_pkts,
+                stats->drop_other_pkts);
+        }
+
+        printf("switch ingress port %" PRIu16
+               " feedback: enqueue-ok=%" PRIu64 " drop-no-free=%" PRIu64
+               " drop-queue-full=%" PRIu64 " tx-ok=%" PRIu64 " tx-retry=%" PRIu64
+               " queued=%u free=%u\n",
+               port_id,
+               __atomic_load_n(&fb_stats->enqueue_ok_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->drop_no_free_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->drop_queue_full_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->tx_ok_pkts, __ATOMIC_RELAXED),
+               __atomic_load_n(&fb_stats->tx_retry_pkts, __ATOMIC_RELAXED),
+               rte_ring_count(ctx.feedback_queues[ingress_idx]),
+               rte_ring_count(ctx.feedback_free_queues[ingress_idx]));
+    }
 
     cleanup_switch(&ctx);
     free(worker_args);
