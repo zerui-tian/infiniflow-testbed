@@ -7,15 +7,17 @@
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
-static int try_reserve_vc_slot(switch_vc_fc_state_t *state) {
-    uint64_t old_occupancy = 0;
+static int try_reserve_ingress_slot(switch_ingress_vc_state_t *state) {
+    uint64_t occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_ACQUIRE);
 
-    old_occupancy = __atomic_fetch_add(&state->occupancy, 1U, __ATOMIC_RELAXED);
-    if (old_occupancy >= state->capacity) {
-        __atomic_fetch_sub(&state->occupancy, 1U, __ATOMIC_RELAXED);
-        return -1;
+    while (occupancy < state->capacity) {
+        if (__atomic_compare_exchange_n(&state->occupancy, &occupancy, occupancy + 1U, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            return 0;
+        }
     }
-    return 0;
+
+    return -1;
 }
 
 int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
@@ -41,48 +43,64 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
         }
 
         eth_hdr = rte_pktmbuf_mtod(mbuf, const struct rte_ether_hdr *);
-        if (eth_hdr->ether_type == rte_cpu_to_be_16(FC_ETHER_TYPE)) {
-            const fc_data_header_t *fc_hdr = NULL;
-            uint32_t vc_id = 0;
-            switch_vc_fc_state_t *vc_state = NULL;
-            switch_vc_stats_t *vc_stats = NULL;
+        if (eth_hdr->ether_type != rte_cpu_to_be_16(FC_ETHER_TYPE)) {
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+
+        if (mbuf->pkt_len < sizeof(*eth_hdr) + FC_DATA_HEADER_SIZE) {
+            rte_pktmbuf_free(mbuf);
+            continue;
+        }
+
+        {
+            const fc_data_header_t *fc_hdr = (const fc_data_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
+            uint32_t vc_id = rte_be_to_cpu_32(fc_hdr->vc_id);
+            uint32_t flow_id = rte_be_to_cpu_32(fc_hdr->flow_id);
+            uint16_t egress_port = 0;
+            uint16_t egress_idx = UINT16_MAX;
+            size_t ingress_state_idx = 0;
+            size_t egress_queue_idx = 0;
             size_t stats_idx = 0;
+            switch_vc_stats_t *vc_stats = NULL;
+            switch_ingress_vc_state_t *ingress_state = NULL;
 
-            if (mbuf->pkt_len < sizeof(*eth_hdr) + FC_DATA_HEADER_SIZE) {
-                rte_pktmbuf_free(mbuf);
-                continue;
-            }
-
-            fc_hdr = (const fc_data_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
-            vc_id = rte_be_to_cpu_32(fc_hdr->vc_id);
             if (vc_id >= ctx->cfg.nb_vc) {
                 rte_pktmbuf_free(mbuf);
                 continue;
             }
 
-            stats_idx = (size_t)ingress_idx * ctx->cfg.nb_vc + vc_id;
+            stats_idx = switch_ingress_vc_state_index(ctx, ingress_idx, vc_id);
             vc_stats = &ctx->vc_stats[stats_idx];
             __atomic_fetch_add(&vc_stats->rx_pkts, 1U, __ATOMIC_RELAXED);
 
-            vc_state = &ctx->vc_states[vc_id];
-            if (try_reserve_vc_slot(vc_state) != 0) {
-                rte_pktmbuf_free(mbuf);
-                __atomic_fetch_add(&vc_stats->drop_capacity_pkts, 1U, __ATOMIC_RELAXED);
-                continue;
-            }
-
-            if (rte_ring_mp_enqueue(ctx->vc_queues[vc_id].ring, mbuf) != 0) {
-                __atomic_fetch_sub(&vc_state->occupancy, 1U, __ATOMIC_RELAXED);
+            egress_port = switch_flow_map_lookup(ctx, flow_id);
+            egress_idx = switch_egress_index_from_port(ctx, egress_port);
+            if (egress_idx == UINT16_MAX) {
                 rte_pktmbuf_free(mbuf);
                 __atomic_fetch_add(&vc_stats->drop_other_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
-            enqueued++;
-            continue;
-        }
+            ingress_state_idx = switch_ingress_vc_state_index(ctx, ingress_idx, vc_id);
+            ingress_state = &ctx->ingress_vc_states[ingress_state_idx];
+            if (try_reserve_ingress_slot(ingress_state) != 0) {
+                rte_pktmbuf_free(mbuf);
+                __atomic_fetch_add(&vc_stats->drop_capacity_pkts, 1U, __ATOMIC_RELAXED);
+                continue;
+            }
 
-        rte_pktmbuf_free(mbuf);
+            egress_queue_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
+            if (rte_ring_mp_enqueue(ctx->egress_vc_queues[egress_queue_idx].ring, mbuf) != 0) {
+                __atomic_fetch_sub(&ingress_state->occupancy, 1U, __ATOMIC_RELAXED);
+                rte_pktmbuf_free(mbuf);
+                __atomic_fetch_add(&vc_stats->drop_other_pkts, 1U, __ATOMIC_RELAXED);
+                continue;
+            }
+
+            __atomic_fetch_add(&ingress_state->total_received, 1U, __ATOMIC_RELAXED);
+            enqueued++;
+        }
     }
 
     return enqueued;

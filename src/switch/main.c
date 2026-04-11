@@ -37,6 +37,11 @@ typedef struct ingress_worker_arg_s {
     uint16_t ingress_idx;
 } ingress_worker_arg_t;
 
+typedef struct egress_worker_arg_s {
+    switch_ctx_t *ctx;
+    uint16_t egress_idx;
+} egress_worker_arg_t;
+
 static void handle_signal(int signum) {
     (void)signum;
     g_force_quit = 1;
@@ -172,7 +177,7 @@ static void usage(const char *prog) {
     printf("Options:\n");
     printf("  --ingress-ports <a,b>   Ingress port list (default: %s)\n", DEFAULT_INGRESS_PORTS);
     printf("  --egress-ports <a,b>    Egress port list (default: %s)\n", DEFAULT_EGRESS_PORTS);
-    printf("  --vcs <num>             Number of shared VCs (default: %u)\n", DEFAULT_NB_VC);
+    printf("  --vcs <num>             Number of VCs per ingress/egress (default: %u)\n", DEFAULT_NB_VC);
     printf("  --vc-ring-size <num>    VC ring size (default: %u)\n", DEFAULT_VC_RING_SIZE);
     printf("  --feedback-ring-size <num> Per-ingress feedback ring size (default: %u)\n",
            DEFAULT_FEEDBACK_RING_SIZE);
@@ -361,23 +366,28 @@ static int init_port(uint16_t port_id, uint16_t rx_queue_id, uint16_t tx_queue_i
     return 0;
 }
 
-static int init_vc_rings(switch_ctx_t *ctx) {
-    uint32_t i = 0;
+static int init_egress_vc_rings(switch_ctx_t *ctx) {
+    uint16_t egress_idx = 0;
+    uint32_t vc_id = 0;
+    size_t nb_queues = (size_t)ctx->cfg.nb_egress_ports * ctx->cfg.nb_vc;
 
-    ctx->vc_queues = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_queues));
-    if (ctx->vc_queues == NULL) {
+    ctx->egress_vc_queues = calloc(nb_queues, sizeof(*ctx->egress_vc_queues));
+    if (ctx->egress_vc_queues == NULL) {
         return -1;
     }
 
-    for (i = 0; i < ctx->cfg.nb_vc; i++) {
-        char ring_name[64];
+    for (egress_idx = 0; egress_idx < ctx->cfg.nb_egress_ports; egress_idx++) {
+        for (vc_id = 0; vc_id < ctx->cfg.nb_vc; vc_id++) {
+            char ring_name[64];
+            size_t queue_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
 
-        snprintf(ring_name, sizeof(ring_name), "switch_vc_ring_%u", i);
-        ctx->vc_queues[i].vc_id = i;
-        ctx->vc_queues[i].ring =
-            rte_ring_create(ring_name, ctx->cfg.vc_ring_size, rte_socket_id(), RING_F_SC_DEQ);
-        if (ctx->vc_queues[i].ring == NULL) {
-            return -1;
+            snprintf(ring_name, sizeof(ring_name), "switch_egress_%u_vc_%u", egress_idx, vc_id);
+            ctx->egress_vc_queues[queue_idx].vc_id = vc_id;
+            ctx->egress_vc_queues[queue_idx].ring =
+                rte_ring_create(ring_name, ctx->cfg.vc_ring_size, rte_socket_id(), RING_F_SC_DEQ);
+            if (ctx->egress_vc_queues[queue_idx].ring == NULL) {
+                return -1;
+            }
         }
     }
 
@@ -429,19 +439,46 @@ static int init_feedback_queues(switch_ctx_t *ctx) {
     return 0;
 }
 
-static int init_vc_states(switch_ctx_t *ctx) {
-    uint32_t i = 0;
+static int init_ingress_vc_states(switch_ctx_t *ctx) {
+    uint16_t ingress_idx = 0;
+    uint32_t vc_id = 0;
+    size_t nb_states = (size_t)ctx->cfg.nb_ingress_ports * ctx->cfg.nb_vc;
 
-    ctx->vc_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_states));
-    if (ctx->vc_states == NULL) {
+    ctx->ingress_vc_states = calloc(nb_states, sizeof(*ctx->ingress_vc_states));
+    if (ctx->ingress_vc_states == NULL) {
         return -1;
     }
 
-    for (i = 0; i < ctx->cfg.nb_vc; i++) {
-        ctx->vc_states[i].fccl = ctx->cfg.initial_fccl;
-        ctx->vc_states[i].fctbs = 0U;
-        ctx->vc_states[i].occupancy = 0U;
-        ctx->vc_states[i].capacity = ctx->cfg.vc_capacity_pkts;
+    for (ingress_idx = 0; ingress_idx < ctx->cfg.nb_ingress_ports; ingress_idx++) {
+        for (vc_id = 0; vc_id < ctx->cfg.nb_vc; vc_id++) {
+            size_t state_idx = switch_ingress_vc_state_index(ctx, ingress_idx, vc_id);
+
+            ctx->ingress_vc_states[state_idx].occupancy = 0U;
+            ctx->ingress_vc_states[state_idx].capacity = ctx->cfg.vc_capacity_pkts;
+            ctx->ingress_vc_states[state_idx].total_received = 0U;
+        }
+    }
+
+    return 0;
+}
+
+static int init_egress_vc_states(switch_ctx_t *ctx) {
+    uint16_t egress_idx = 0;
+    uint32_t vc_id = 0;
+    size_t nb_states = (size_t)ctx->cfg.nb_egress_ports * ctx->cfg.nb_vc;
+
+    ctx->egress_vc_states = calloc(nb_states, sizeof(*ctx->egress_vc_states));
+    if (ctx->egress_vc_states == NULL) {
+        return -1;
+    }
+
+    for (egress_idx = 0; egress_idx < ctx->cfg.nb_egress_ports; egress_idx++) {
+        for (vc_id = 0; vc_id < ctx->cfg.nb_vc; vc_id++) {
+            size_t state_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
+
+            ctx->egress_vc_states[state_idx].fccl = ctx->cfg.initial_fccl;
+            ctx->egress_vc_states[state_idx].fctbs = 0U;
+        }
     }
 
     return 0;
@@ -467,23 +504,47 @@ static int init_feedback_stats(switch_ctx_t *ctx) {
     return 0;
 }
 
-static uint64_t cbfc_calc_credit(const switch_ctx_t *ctx, uint32_t vc_id) {
-    const switch_vc_fc_state_t *state = &ctx->vc_states[vc_id];
+static uint64_t cbfc_calc_credit(const switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id) {
+    const switch_egress_vc_state_t *state =
+        &ctx->egress_vc_states[switch_egress_vc_state_index(ctx, egress_idx, vc_id)];
     uint64_t fccl = __atomic_load_n(&state->fccl, __ATOMIC_ACQUIRE);
     uint64_t fctbs = __atomic_load_n(&state->fctbs, __ATOMIC_RELAXED);
     return (fccl > fctbs) ? (fccl - fctbs) : 0U;
 }
 
-static void cbfc_on_feedback_rx(switch_ctx_t *ctx, uint32_t vc_id, uint64_t fccl) {
-    __atomic_store_n(&ctx->vc_states[vc_id].fccl, fccl, __ATOMIC_RELEASE);
+static void cbfc_on_feedback_rx(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl) {
+    size_t state_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
+
+    __atomic_store_n(&ctx->egress_vc_states[state_idx].fccl, fccl, __ATOMIC_RELEASE);
 }
 
-static uint64_t cbfc_on_tx_success(switch_ctx_t *ctx, uint32_t vc_id) {
-    switch_vc_fc_state_t *state = &ctx->vc_states[vc_id];
-    uint64_t new_fctbs = __atomic_fetch_add(&state->fctbs, 1U, __ATOMIC_RELAXED) + 1U;
-    uint64_t occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_RELAXED);
-    uint64_t remaining = (state->capacity > occupancy) ? (state->capacity - occupancy) : 0U;
-    return new_fctbs + remaining;
+static uint64_t release_ingress_credit(switch_ingress_vc_state_t *state) {
+    uint64_t occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_ACQUIRE);
+
+    while (occupancy > 0U) {
+        if (__atomic_compare_exchange_n(&state->occupancy, &occupancy, occupancy - 1U, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            break;
+        }
+    }
+
+    occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&state->total_received, __ATOMIC_RELAXED) +
+           ((state->capacity > occupancy) ? (state->capacity - occupancy) : 0U);
+}
+
+static uint64_t cbfc_on_tx_success(switch_ctx_t *ctx, uint16_t ingress_idx, uint16_t egress_idx,
+                                   uint32_t vc_id) {
+    size_t egress_state_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
+    switch_egress_vc_state_t *egress_state = &ctx->egress_vc_states[egress_state_idx];
+
+    __atomic_fetch_add(&egress_state->fctbs, 1U, __ATOMIC_RELAXED);
+    if (ingress_idx >= ctx->cfg.nb_ingress_ports) {
+        return 0U;
+    }
+
+    return release_ingress_credit(
+        &ctx->ingress_vc_states[switch_ingress_vc_state_index(ctx, ingress_idx, vc_id)]);
 }
 
 void switch_cbfc_ops_init(switch_ctx_t *ctx) {
@@ -517,12 +578,12 @@ static int feedback_gen_loop(void *arg) {
 }
 
 static int forward_loop(void *arg) {
-    switch_ctx_t *ctx = (switch_ctx_t *)arg;
+    egress_worker_arg_t *worker = (egress_worker_arg_t *)arg;
 
     while (!g_force_quit) {
-        switch_forward_run_tick(ctx);
+        switch_forward_run_tick(worker->ctx, worker->egress_idx);
     }
-    while (switch_forward_run_tick(ctx) > 0U) {
+    while (switch_forward_run_tick(worker->ctx, worker->egress_idx) > 0U) {
     }
 
     return 0;
@@ -544,15 +605,15 @@ static void cleanup_switch(switch_ctx_t *ctx) {
     struct rte_mbuf *mbuf = NULL;
     void *ptr = NULL;
 
-    if (ctx->vc_queues != NULL) {
-        for (i = 0; i < ctx->cfg.nb_vc; i++) {
-            if (ctx->vc_queues[i].ring == NULL) {
+    if (ctx->egress_vc_queues != NULL) {
+        for (i = 0; i < (uint32_t)ctx->cfg.nb_egress_ports * ctx->cfg.nb_vc; i++) {
+            if (ctx->egress_vc_queues[i].ring == NULL) {
                 continue;
             }
-            while (rte_ring_sc_dequeue(ctx->vc_queues[i].ring, (void **)&mbuf) == 0) {
+            while (rte_ring_sc_dequeue(ctx->egress_vc_queues[i].ring, (void **)&mbuf) == 0) {
                 rte_pktmbuf_free(mbuf);
             }
-            rte_ring_free(ctx->vc_queues[i].ring);
+            rte_ring_free(ctx->egress_vc_queues[i].ring);
         }
     }
 
@@ -588,21 +649,24 @@ static void cleanup_switch(switch_ctx_t *ctx) {
     free(ctx->feedback_pool);
     free(ctx->feedback_stats);
     free(ctx->vc_stats);
-    free(ctx->vc_states);
+    free(ctx->egress_vc_states);
+    free(ctx->ingress_vc_states);
     free(ctx->feedback_queues);
     free(ctx->feedback_free_queues);
-    free(ctx->vc_queues);
+    free(ctx->egress_vc_queues);
 }
 
 int main(int argc, char **argv) {
     switch_ctx_t ctx;
-    ingress_worker_arg_t *worker_args = NULL;
+    ingress_worker_arg_t *ingress_worker_args = NULL;
+    egress_worker_arg_t *egress_worker_args = NULL;
     unsigned int *scheduler_lcores = NULL;
     unsigned int *generator_lcores = NULL;
-    unsigned int forward_lcore = 0;
+    unsigned int *egress_lcores = NULL;
     unsigned int handler_lcore = 0;
     uint32_t next_slot = 0;
     uint16_t ingress_idx = 0;
+    uint16_t egress_idx = 0;
     unsigned int lcore_id = 0;
     uint32_t data_room_size = 0;
     int eal_argc = 0;
@@ -689,7 +753,8 @@ int main(int argc, char **argv) {
         RTE_LOG(INFO, USER1, "switch: egress port %" PRIu16 " started\n", egress_port);
     }
 
-    if (init_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 || init_vc_states(&ctx) != 0 ||
+    if (init_egress_vc_rings(&ctx) != 0 || init_feedback_queues(&ctx) != 0 ||
+        init_ingress_vc_states(&ctx) != 0 || init_egress_vc_states(&ctx) != 0 ||
         init_vc_stats(&ctx) != 0 || init_feedback_stats(&ctx) != 0) {
         rte_exit(EXIT_FAILURE, "switch queue/state init failed\n");
     }
@@ -698,16 +763,23 @@ int main(int argc, char **argv) {
         switch_cbfc_ops_init(&ctx);
     }
 
-    worker_args = calloc(ctx.cfg.nb_ingress_ports, sizeof(*worker_args));
+    ingress_worker_args = calloc(ctx.cfg.nb_ingress_ports, sizeof(*ingress_worker_args));
+    egress_worker_args = calloc(ctx.cfg.nb_egress_ports, sizeof(*egress_worker_args));
     scheduler_lcores = calloc(ctx.cfg.nb_ingress_ports, sizeof(*scheduler_lcores));
     generator_lcores = calloc(ctx.cfg.nb_ingress_ports, sizeof(*generator_lcores));
-    if (worker_args == NULL || scheduler_lcores == NULL || generator_lcores == NULL) {
+    egress_lcores = calloc(ctx.cfg.nb_egress_ports, sizeof(*egress_lcores));
+    if (ingress_worker_args == NULL || egress_worker_args == NULL || scheduler_lcores == NULL ||
+        generator_lcores == NULL || egress_lcores == NULL) {
         rte_exit(EXIT_FAILURE, "worker allocation failed\n");
     }
 
     for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
-        worker_args[ingress_idx].ctx = &ctx;
-        worker_args[ingress_idx].ingress_idx = ingress_idx;
+        ingress_worker_args[ingress_idx].ctx = &ctx;
+        ingress_worker_args[ingress_idx].ingress_idx = ingress_idx;
+    }
+    for (egress_idx = 0; egress_idx < ctx.cfg.nb_egress_ports; egress_idx++) {
+        egress_worker_args[egress_idx].ctx = &ctx;
+        egress_worker_args[egress_idx].egress_idx = egress_idx;
     }
 
     RTE_LCORE_FOREACH_WORKER(lcore_id) {
@@ -719,8 +791,9 @@ int main(int argc, char **argv) {
             generator_lcores[next_slot++ - ctx.cfg.nb_ingress_ports] = lcore_id;
             continue;
         }
-        if (forward_lcore == 0U) {
-            forward_lcore = lcore_id;
+        if (next_slot <
+            (uint32_t)ctx.cfg.nb_ingress_ports * 2U + (uint32_t)ctx.cfg.nb_egress_ports) {
+            egress_lcores[next_slot++ - (uint32_t)ctx.cfg.nb_ingress_ports * 2U] = lcore_id;
             continue;
         }
         if (handler_lcore == 0U) {
@@ -734,23 +807,33 @@ int main(int argc, char **argv) {
             rte_exit(EXIT_FAILURE, "Need more worker lcores for scheduler/generator cores\n");
         }
     }
-    if (forward_lcore == 0U || handler_lcore == 0U) {
-        rte_exit(EXIT_FAILURE, "Need worker lcores for forward/handler cores\n");
+    for (egress_idx = 0; egress_idx < ctx.cfg.nb_egress_ports; egress_idx++) {
+        if (egress_lcores[egress_idx] == 0U) {
+            rte_exit(EXIT_FAILURE, "Need worker lcores for egress scheduler cores\n");
+        }
+    }
+    if (handler_lcore == 0U) {
+        rte_exit(EXIT_FAILURE, "Need worker lcore for feedback handler core\n");
     }
 
     for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
-        rte_eal_remote_launch(scheduler_loop, &worker_args[ingress_idx], scheduler_lcores[ingress_idx]);
-        rte_eal_remote_launch(feedback_gen_loop, &worker_args[ingress_idx],
+        rte_eal_remote_launch(scheduler_loop, &ingress_worker_args[ingress_idx],
+                              scheduler_lcores[ingress_idx]);
+        rte_eal_remote_launch(feedback_gen_loop, &ingress_worker_args[ingress_idx],
                               generator_lcores[ingress_idx]);
     }
-    rte_eal_remote_launch(forward_loop, &ctx, forward_lcore);
+    for (egress_idx = 0; egress_idx < ctx.cfg.nb_egress_ports; egress_idx++) {
+        rte_eal_remote_launch(forward_loop, &egress_worker_args[egress_idx], egress_lcores[egress_idx]);
+    }
     rte_eal_remote_launch(feedback_handler_loop, &ctx, handler_lcore);
 
     for (ingress_idx = 0; ingress_idx < ctx.cfg.nb_ingress_ports; ingress_idx++) {
         rte_eal_wait_lcore(scheduler_lcores[ingress_idx]);
         rte_eal_wait_lcore(generator_lcores[ingress_idx]);
     }
-    rte_eal_wait_lcore(forward_lcore);
+    for (egress_idx = 0; egress_idx < ctx.cfg.nb_egress_ports; egress_idx++) {
+        rte_eal_wait_lcore(egress_lcores[egress_idx]);
+    }
     rte_eal_wait_lcore(handler_lcore);
 
     printf("Switch completed.\n");
@@ -786,8 +869,10 @@ int main(int argc, char **argv) {
     }
 
     cleanup_switch(&ctx);
-    free(worker_args);
+    free(ingress_worker_args);
+    free(egress_worker_args);
     free(scheduler_lcores);
     free(generator_lcores);
+    free(egress_lcores);
     return 0;
 }

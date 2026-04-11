@@ -2,6 +2,7 @@
 #define INFINIFLOW_SWITCH_CTX_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include <rte_ether.h>
@@ -16,12 +17,16 @@
 #define SWITCH_MAX_EGRESS_PORTS 8U
 #define SWITCH_MAX_ROUTE_CSV_PATH 512U
 
-typedef struct switch_vc_fc_state_s {
-    uint64_t fccl;
-    uint64_t fctbs;
+typedef struct switch_ingress_vc_state_s {
     uint64_t occupancy;
     uint64_t capacity;
-} switch_vc_fc_state_t;
+    uint64_t total_received;
+} switch_ingress_vc_state_t;
+
+typedef struct switch_egress_vc_state_s {
+    uint64_t fccl;
+    uint64_t fctbs;
+} switch_egress_vc_state_t;
 
 typedef struct switch_feedback_msg_s {
     uint32_t vc_id;
@@ -51,9 +56,10 @@ typedef struct switch_route_table_s {
 
 struct switch_ctx_s;
 typedef struct switch_fc_ops_s {
-    uint64_t (*calc_credit)(const struct switch_ctx_s *ctx, uint32_t vc_id);
-    void (*on_feedback_rx)(struct switch_ctx_s *ctx, uint32_t vc_id, uint64_t fccl);
-    uint64_t (*on_tx_success)(struct switch_ctx_s *ctx, uint32_t vc_id);
+    uint64_t (*calc_credit)(const struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id);
+    void (*on_feedback_rx)(struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl);
+    uint64_t (*on_tx_success)(struct switch_ctx_s *ctx, uint16_t ingress_idx, uint16_t egress_idx,
+                              uint32_t vc_id);
 } switch_fc_ops_t;
 
 typedef struct switch_config_s {
@@ -83,10 +89,11 @@ typedef struct switch_ctx_s {
     struct rte_ether_addr egress_macs[SWITCH_MAX_EGRESS_PORTS];
     switch_route_table_t route_table;
 
-    vc_queue_t *vc_queues;
+    vc_queue_t *egress_vc_queues;
     struct rte_ring **feedback_queues;
     struct rte_ring **feedback_free_queues;
-    switch_vc_fc_state_t *vc_states;
+    switch_ingress_vc_state_t *ingress_vc_states;
+    switch_egress_vc_state_t *egress_vc_states;
     switch_feedback_msg_t *feedback_pool;
 
     struct rte_mempool *mbuf_pool;
@@ -98,7 +105,7 @@ typedef struct switch_ctx_s {
 } switch_ctx_t;
 
 int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);
-uint32_t switch_forward_run_tick(switch_ctx_t *ctx);
+uint32_t switch_forward_run_tick(switch_ctx_t *ctx, uint16_t egress_idx);
 uint32_t switch_feedback_gen_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);
 uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx);
 
@@ -106,7 +113,18 @@ int switch_route_table_load(switch_ctx_t *ctx);
 void switch_route_table_reset(switch_ctx_t *ctx);
 uint16_t switch_flow_map_lookup(const switch_ctx_t *ctx, uint32_t flow_id);
 uint16_t switch_egress_index_from_port(const switch_ctx_t *ctx, uint16_t port_id);
+uint16_t switch_ingress_index_from_port(const switch_ctx_t *ctx, uint16_t port_id);
 
 void switch_cbfc_ops_init(switch_ctx_t *ctx);
+
+static inline size_t switch_ingress_vc_state_index(const switch_ctx_t *ctx, uint16_t ingress_idx,
+                                                   uint32_t vc_id) {
+    return (size_t)ingress_idx * ctx->cfg.nb_vc + vc_id;
+}
+
+static inline size_t switch_egress_vc_state_index(const switch_ctx_t *ctx, uint16_t egress_idx,
+                                                  uint32_t vc_id) {
+    return (size_t)egress_idx * ctx->cfg.nb_vc + vc_id;
+}
 
 #endif

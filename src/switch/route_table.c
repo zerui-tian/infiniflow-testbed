@@ -85,6 +85,18 @@ uint16_t switch_egress_index_from_port(const switch_ctx_t *ctx, uint16_t port_id
     return UINT16_MAX;
 }
 
+uint16_t switch_ingress_index_from_port(const switch_ctx_t *ctx, uint16_t port_id) {
+    uint16_t i = 0;
+
+    for (i = 0; i < ctx->cfg.nb_ingress_ports; i++) {
+        if (ctx->cfg.ingress_ports[i] == port_id) {
+            return i;
+        }
+    }
+
+    return UINT16_MAX;
+}
+
 void switch_route_table_reset(switch_ctx_t *ctx) {
     free(ctx->route_table.ports);
     ctx->route_table.ports = NULL;

@@ -51,7 +51,7 @@ uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx) {
             vc_id = rte_be_to_cpu_32(fb_hdr->vc_id);
             if (vc_id < ctx->cfg.nb_vc && ctx->fc_ops != NULL && ctx->fc_ops->on_feedback_rx != NULL) {
                 fccl = fc_be64_to_cpu(fb_hdr->fccl);
-                ctx->fc_ops->on_feedback_rx(ctx, vc_id, fccl);
+                ctx->fc_ops->on_feedback_rx(ctx, egress_idx, vc_id, fccl);
                 processed++;
             }
 
