@@ -6,7 +6,7 @@ SRC_DIR="/home/fnil-fdu/infiniflow-testbed"
 DST_DIR="~/infiniflow-testbed"
 
 DST_HOSTS=(
-  "B03_tmp2_server2"
+  # "B03_tmp2_server2"
   "B03_tmp3_server1"
   "B06-4_server4_ns3_server"
   "B06-3_server5"
