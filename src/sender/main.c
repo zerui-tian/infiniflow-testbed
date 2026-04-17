@@ -28,6 +28,9 @@
 #define DEFAULT_RX_BURST 64U
 #define DEFAULT_TICK_US 1000U
 #define DEFAULT_INITIAL_FCCL 1024U
+#define DEFAULT_INFINIFLOW_QMIN 1U
+#define DEFAULT_INFINIFLOW_QMAX 1U
+#define DEFAULT_INFINIFLOW_INITIAL_THRESHOLD 1U
 #define MBUF_CACHE_SIZE 256U
 
 typedef struct sender_app_config_s {
@@ -43,6 +46,9 @@ typedef struct sender_app_config_s {
     uint32_t rx_burst_size;
     uint32_t tick_us;
     uint64_t initial_fccl;
+    uint64_t qmin;
+    uint64_t qmax;
+    uint64_t initial_threshold;
     fc_mode_t fc_mode;
 } sender_app_config_t;
 
@@ -126,6 +132,10 @@ static int parse_fc_mode(const char *s, fc_mode_t *mode) {
     }
     if (strcmp(s, "cbfc") == 0) {
         *mode = FC_MODE_CBFC;
+        return 0;
+    }
+    if (strcmp(s, "infiniflow") == 0) {
+        *mode = FC_MODE_INFINIFLOW;
         return 0;
     }
     return -1;
@@ -305,8 +315,11 @@ static void usage(const char *prog) {
     printf("  --tx-burst <num>     TX burst size (default: 64)\n");
     printf("  --rx-burst <num>     RX burst size for feedback (default: 64)\n");
     printf("  --tick-us <num>      Producer tick interval us (default: 1000)\n");
-    printf("  --fc-mode <mode>     Flow control mode: none|cbfc (default: none)\n");
+    printf("  --fc-mode <mode>     Flow control mode: none|cbfc|infiniflow (default: none)\n");
     printf("  --initial-fccl <n>   Initial CBFC FCCL per VC (default: 1024)\n");
+    printf("  --qmin <n>           InfiniFlow qmin (default: 1)\n");
+    printf("  --qmax <n>           InfiniFlow qmax (default: 1)\n");
+    printf("  --initial-threshold <n> InfiniFlow initial threshold per VC (default: 1)\n");
 }
 
 static int parse_app_args(int argc, char **argv, sender_app_config_t *cfg) {
@@ -324,6 +337,9 @@ static int parse_app_args(int argc, char **argv, sender_app_config_t *cfg) {
         {"tick-us", required_argument, 0, 't'},
         {"fc-mode", required_argument, 0, 'f'},
         {"initial-fccl", required_argument, 0, 'i'},
+        {"qmin", required_argument, 0, 'q'},
+        {"qmax", required_argument, 0, 'Q'},
+        {"initial-threshold", required_argument, 0, 'T'},
         {0, 0, 0, 0},
     };
     uint16_t *port_list = NULL;
@@ -351,9 +367,12 @@ static int parse_app_args(int argc, char **argv, sender_app_config_t *cfg) {
     cfg->rx_burst_size = DEFAULT_RX_BURST;
     cfg->tick_us = DEFAULT_TICK_US;
     cfg->initial_fccl = DEFAULT_INITIAL_FCCL;
+    cfg->qmin = DEFAULT_INFINIFLOW_QMIN;
+    cfg->qmax = DEFAULT_INFINIFLOW_QMAX;
+    cfg->initial_threshold = DEFAULT_INFINIFLOW_INITIAL_THRESHOLD;
     cfg->fc_mode = FC_MODE_NONE;
 
-    while ((opt = getopt_long(argc, argv, "c:p:C:P:v:r:s:m:b:x:t:f:i:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "c:p:C:P:v:r:s:m:b:x:t:f:i:q:Q:T:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c':
                 free(single_csv);
@@ -442,6 +461,24 @@ static int parse_app_args(int argc, char **argv, sender_app_config_t *cfg) {
                 break;
             case 'i':
                 if (parse_u64(optarg, &cfg->initial_fccl) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                break;
+            case 'q':
+                if (parse_u64(optarg, &cfg->qmin) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                break;
+            case 'Q':
+                if (parse_u64(optarg, &cfg->qmax) != 0) {
+                    free(single_csv);
+                    return -1;
+                }
+                break;
+            case 'T':
+                if (parse_u64(optarg, &cfg->initial_threshold) != 0) {
                     free(single_csv);
                     return -1;
                 }
@@ -643,7 +680,14 @@ static int init_vc_fc_states(sender_ctx_t *ctx) {
     for (i = 0; i < ctx->cfg.nb_vc; i++) {
         ctx->vc_fc_states[i].fccl = ctx->cfg.initial_fccl;
         ctx->vc_fc_states[i].fctbs = 0U;
+        ctx->vc_fc_states[i].tx_pkts = 0U;
+        ctx->vc_fc_states[i].vc_dr = 0U;
+        ctx->vc_fc_states[i].vc_bklg = 0U;
+        ctx->vc_fc_states[i].threshold = ctx->cfg.initial_threshold;
+        ctx->vc_fc_states[i].state = SENDER_INFINIFLOW_STATE_UN;
     }
+    ctx->port_fc_state.fccl = ctx->cfg.initial_fccl;
+    ctx->port_fc_state.fctbs = 0U;
 
     return 0;
 }
@@ -701,6 +745,9 @@ static int init_sender_port_ctx(sender_ctx_t *ctx, const sender_app_config_t *ap
     ctx->cfg.rx_burst_size = app_cfg->rx_burst_size;
     ctx->cfg.tick_us = app_cfg->tick_us;
     ctx->cfg.initial_fccl = app_cfg->initial_fccl;
+    ctx->cfg.qmin = app_cfg->qmin;
+    ctx->cfg.qmax = app_cfg->qmax;
+    ctx->cfg.initial_threshold = app_cfg->initial_threshold;
     ctx->cfg.fc_mode = app_cfg->fc_mode;
     ctx->hz = rte_get_timer_hz();
 
@@ -917,13 +964,41 @@ int main(int argc, char **argv) {
             uint64_t fctbs = __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].fctbs, __ATOMIC_RELAXED);
             uint64_t feedback_rx =
                 __atomic_load_n(&app.port_ctxs[i].feedback_rx_pkts[vc_id], __ATOMIC_RELAXED);
-            uint64_t credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
 
-            printf("  sender port=%u vc=%" PRIu32
-                   ": ring=%u feedback-rx=%" PRIu64 " fccl=%" PRIu64
-                   " fctbs=%" PRIu64 " credit=%" PRIu64 "\n",
-                   app.port_ctxs[i].cfg.port_id, vc_id,
-                   rte_ring_count(app.port_ctxs[i].vc_queues[vc_id].ring), feedback_rx, fccl, fctbs, credit);
+            if (app.port_ctxs[i].cfg.fc_mode == FC_MODE_INFINIFLOW) {
+                uint64_t tx_pkts =
+                    __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].tx_pkts, __ATOMIC_RELAXED);
+                uint64_t vc_dr =
+                    __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].vc_dr, __ATOMIC_RELAXED);
+                uint64_t vc_bklg =
+                    __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].vc_bklg, __ATOMIC_RELAXED);
+                uint64_t threshold =
+                    __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].threshold, __ATOMIC_RELAXED);
+                uint64_t port_fccl =
+                    __atomic_load_n(&app.port_ctxs[i].port_fc_state.fccl, __ATOMIC_RELAXED);
+                uint64_t port_fctbs =
+                    __atomic_load_n(&app.port_ctxs[i].port_fc_state.fctbs, __ATOMIC_RELAXED);
+                uint64_t credit_pool = (port_fccl > port_fctbs) ? (port_fccl - port_fctbs) : 0U;
+                uint64_t inflight = (tx_pkts > vc_dr) ? (tx_pkts - vc_dr) : 0U;
+
+                printf("  sender port=%u vc=%" PRIu32
+                       ": ring=%u feedback-rx=%" PRIu64 " port-credit=%" PRIu64
+                       " threshold=%" PRIu64 " inflight=%" PRIu64
+                       " vc-dr=%" PRIu64 " vc-bklg=%" PRIu64 " state=%" PRIu32 "\n",
+                       app.port_ctxs[i].cfg.port_id, vc_id,
+                       rte_ring_count(app.port_ctxs[i].vc_queues[vc_id].ring), feedback_rx, credit_pool,
+                       threshold, inflight, vc_dr, vc_bklg,
+                       __atomic_load_n(&app.port_ctxs[i].vc_fc_states[vc_id].state, __ATOMIC_RELAXED));
+            } else {
+                uint64_t credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
+
+                printf("  sender port=%u vc=%" PRIu32
+                       ": ring=%u feedback-rx=%" PRIu64 " fccl=%" PRIu64
+                       " fctbs=%" PRIu64 " credit=%" PRIu64 "\n",
+                       app.port_ctxs[i].cfg.port_id, vc_id,
+                       rte_ring_count(app.port_ctxs[i].vc_queues[vc_id].ring), feedback_rx, fccl, fctbs,
+                       credit);
+            }
         }
         total_enqueued += app.port_ctxs[i].total_pkts_enqueued;
         total_tx += app.port_ctxs[i].total_pkts_tx;

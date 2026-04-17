@@ -15,7 +15,23 @@
 typedef struct sender_vc_fc_state_s {
     uint64_t fccl;
     uint64_t fctbs;
+    uint64_t tx_pkts;
+    uint64_t vc_dr;
+    uint64_t vc_bklg;
+    uint64_t threshold;
+    uint32_t state;
 } sender_vc_fc_state_t;
+
+typedef struct sender_port_fc_state_s {
+    uint64_t fccl;
+    uint64_t fctbs;
+} sender_port_fc_state_t;
+
+typedef enum sender_infiniflow_state_e {
+    SENDER_INFINIFLOW_STATE_UN = 0,
+    SENDER_INFINIFLOW_STATE_TA = 1,
+    SENDER_INFINIFLOW_STATE_WT = 2,
+} sender_infiniflow_state_t;
 
 typedef struct sender_config_s {
     const char *csv_path;
@@ -30,6 +46,9 @@ typedef struct sender_config_s {
     uint32_t rx_burst_size;
     uint32_t tick_us;
     uint64_t initial_fccl;
+    uint64_t qmin;
+    uint64_t qmax;
+    uint64_t initial_threshold;
     fc_mode_t fc_mode;
 } sender_config_t;
 
@@ -46,6 +65,7 @@ typedef struct sender_ctx_s {
     uint32_t nb_active;
 
     vc_queue_t *vc_queues;
+    sender_port_fc_state_t port_fc_state;
     sender_vc_fc_state_t *vc_fc_states;
     uint64_t *feedback_rx_pkts;
 

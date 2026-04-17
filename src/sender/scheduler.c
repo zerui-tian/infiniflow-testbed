@@ -64,6 +64,7 @@ int scheduler_run_tick(sender_ctx_t *ctx) {
 
         fc_hdr->flow_id = rte_cpu_to_be_32(flow->fid);
         fc_hdr->vc_id = rte_cpu_to_be_32(flow->vc);
+        fc_hdr->flags = 0;
         memset(payload, 0, payload_len);
 
         if (rte_ring_sp_enqueue(q->ring, mbuf) != 0) {

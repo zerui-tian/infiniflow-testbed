@@ -7,13 +7,29 @@
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
-static int try_reserve_ingress_slot(switch_ingress_vc_state_t *state) {
-    uint64_t occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_ACQUIRE);
+static int try_reserve_ingress_slot(switch_ctx_t *ctx, switch_ingress_port_state_t *port_state,
+                                    switch_ingress_vc_state_t *vc_state) {
+    if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+        uint64_t occupancy = __atomic_load_n(&port_state->occupancy, __ATOMIC_ACQUIRE);
 
-    while (occupancy < state->capacity) {
-        if (__atomic_compare_exchange_n(&state->occupancy, &occupancy, occupancy + 1U, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            return 0;
+        while (occupancy < ctx->cfg.port_buffer_pkts) {
+            if (__atomic_compare_exchange_n(&port_state->occupancy, &occupancy, occupancy + 1U, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                __atomic_fetch_add(&vc_state->occupancy, 1U, __ATOMIC_RELAXED);
+                return 0;
+            }
+        }
+        return -1;
+    }
+
+    {
+        uint64_t occupancy = __atomic_load_n(&vc_state->occupancy, __ATOMIC_ACQUIRE);
+
+        while (occupancy < vc_state->capacity) {
+            if (__atomic_compare_exchange_n(&vc_state->occupancy, &occupancy, occupancy + 1U, false,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                return 0;
+            }
         }
     }
 
@@ -64,6 +80,8 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             size_t stats_idx = 0;
             switch_vc_stats_t *vc_stats = NULL;
             switch_ingress_vc_state_t *ingress_state = NULL;
+            switch_ingress_port_state_t *port_state = NULL;
+            uint32_t flags = fc_be32_to_cpu(fc_hdr->flags);
 
             if (vc_id >= ctx->cfg.nb_vc) {
                 rte_pktmbuf_free(mbuf);
@@ -84,21 +102,34 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
 
             ingress_state_idx = switch_ingress_vc_state_index(ctx, ingress_idx, vc_id);
             ingress_state = &ctx->ingress_vc_states[ingress_state_idx];
-            if (try_reserve_ingress_slot(ingress_state) != 0) {
+            port_state = &ctx->ingress_port_states[ingress_idx];
+            if (try_reserve_ingress_slot(ctx, port_state, ingress_state) != 0) {
                 rte_pktmbuf_free(mbuf);
                 __atomic_fetch_add(&vc_stats->drop_capacity_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
+            if ((flags & FC_DATA_FLAG_TA) != 0U) {
+                __atomic_store_n(&ingress_state->state, 1U, __ATOMIC_RELEASE);
+                __atomic_fetch_or(&ingress_state->pending_feedback_flags, INFINIFLOW_FEEDBACK_FLAG_TA,
+                                  __ATOMIC_RELAXED);
+            }
+
             egress_queue_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
             if (rte_ring_mp_enqueue(ctx->egress_vc_queues[egress_queue_idx].ring, mbuf) != 0) {
                 __atomic_fetch_sub(&ingress_state->occupancy, 1U, __ATOMIC_RELAXED);
+                if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+                    __atomic_fetch_sub(&port_state->occupancy, 1U, __ATOMIC_RELAXED);
+                }
                 rte_pktmbuf_free(mbuf);
                 __atomic_fetch_add(&vc_stats->drop_other_pkts, 1U, __ATOMIC_RELAXED);
                 continue;
             }
 
             __atomic_fetch_add(&ingress_state->total_received, 1U, __ATOMIC_RELAXED);
+            if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+                __atomic_fetch_add(&port_state->total_received, 1U, __ATOMIC_RELAXED);
+            }
             enqueued++;
         }
     }

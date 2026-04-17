@@ -26,6 +26,10 @@
 #define DEFAULT_TX_BURST 64U
 #define DEFAULT_NB_VC 8U
 #define DEFAULT_CBFC_TOTAL_BUFFER_PKTS 8192U
+#define DEFAULT_INFINIFLOW_QMIN 1U
+#define DEFAULT_INFINIFLOW_QMAX 1U
+#define DEFAULT_INFINIFLOW_INITIAL_THRESHOLD 1U
+#define DEFAULT_INFINIFLOW_PORT_BUFFER_PKTS 1U
 #define DEFAULT_PKT_SIZE 8000U
 #define DEFAULT_OUTPUT_PATH "receiver_flow_stats.csv"
 #define DEFAULT_FEEDBACK_RING_SIZE 1024U
@@ -43,6 +47,10 @@ typedef struct receiver_app_config_s {
     uint32_t mempool_size;
     uint32_t feedback_ring_size;
     uint64_t cbfc_total_buffer_pkts;
+    uint64_t qmin;
+    uint64_t qmax;
+    uint64_t initial_threshold;
+    uint64_t port_buffer_pkts;
     fc_mode_t fc_mode;
     const char *output_path;
 } receiver_app_config_t;
@@ -123,6 +131,10 @@ static int parse_fc_mode(const char *s, fc_mode_t *mode) {
     }
     if (strcmp(s, "cbfc") == 0) {
         *mode = FC_MODE_CBFC;
+        return 0;
+    }
+    if (strcmp(s, "infiniflow") == 0) {
+        *mode = FC_MODE_INFINIFLOW;
         return 0;
     }
     return -1;
@@ -220,9 +232,13 @@ static void usage(const char *prog) {
     printf("  --tx-burst <num>     TX burst size for feedback (default: 64)\n");
     printf("  --pkt-size <bytes>   Expected packet size in bytes (default: 8000)\n");
     printf("  --mempool <num>      Per-port mempool object count (default: 32768)\n");
-    printf("  --fc-mode <mode>     Flow control mode: none|cbfc (default: none)\n");
+    printf("  --fc-mode <mode>     Flow control mode: none|cbfc|infiniflow (default: none)\n");
     printf("  --cbfc-buffer-pkts <num>  Per-port CBFC buffer packets shared by all VCs (default: 8192)\n");
     printf("  --feedback-ring-size <num>  Per-port CBFC feedback ring depth (default: 1024)\n");
+    printf("  --qmin <num>         InfiniFlow qmin (default: 1)\n");
+    printf("  --qmax <num>         InfiniFlow qmax (default: 1)\n");
+    printf("  --initial-threshold <num>  InfiniFlow initial threshold (default: 1)\n");
+    printf("  --port-buffer-pkts <num>   InfiniFlow shared port buffer packets (default: 1)\n");
     printf("  --output <path>      Output CSV file path (default: receiver_flow_stats.csv)\n");
 }
 
@@ -237,12 +253,16 @@ static int parse_app_args(int argc, char **argv, receiver_app_config_t *cfg) {
         {"fc-mode", required_argument, 0, 'f'},
         {"cbfc-buffer-pkts", required_argument, 0, 'c'},
         {"feedback-ring-size", required_argument, 0, 'q'},
+        {"qmin", required_argument, 0, 'n'},
+        {"qmax", required_argument, 0, 'N'},
+        {"initial-threshold", required_argument, 0, 'T'},
+        {"port-buffer-pkts", required_argument, 0, 'B'},
         {"output", required_argument, 0, 'o'},
         {0, 0, 0, 0},
     };
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "P:v:b:t:s:m:f:c:q:o:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:v:b:t:s:m:f:c:q:n:N:T:B:o:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'P': {
                 uint16_t *port_ids = NULL;
@@ -293,6 +313,26 @@ static int parse_app_args(int argc, char **argv, receiver_app_config_t *cfg) {
                 break;
             case 'q':
                 if (parse_u32(optarg, &cfg->feedback_ring_size) != 0) {
+                    return -1;
+                }
+                break;
+            case 'n':
+                if (parse_u64(optarg, &cfg->qmin) != 0) {
+                    return -1;
+                }
+                break;
+            case 'N':
+                if (parse_u64(optarg, &cfg->qmax) != 0) {
+                    return -1;
+                }
+                break;
+            case 'T':
+                if (parse_u64(optarg, &cfg->initial_threshold) != 0) {
+                    return -1;
+                }
+                break;
+            case 'B':
+                if (parse_u64(optarg, &cfg->port_buffer_pkts) != 0) {
                     return -1;
                 }
                 break;
@@ -418,20 +458,25 @@ static int init_vc_cbfc_states(receiver_ctx_t *ctx) {
     uint64_t base = 0;
     uint64_t rem = 0;
 
-    if (ctx->cfg.fc_mode != FC_MODE_CBFC) {
-        return 0;
-    }
+    if (ctx->cfg.fc_mode == FC_MODE_CBFC) {
+        ctx->vc_cbfc_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_cbfc_states));
+        if (ctx->vc_cbfc_states == NULL) {
+            return -1;
+        }
 
-    ctx->vc_cbfc_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_cbfc_states));
-    if (ctx->vc_cbfc_states == NULL) {
-        return -1;
-    }
-
-    base = ctx->cfg.cbfc_total_buffer_pkts / (uint64_t)ctx->cfg.nb_vc;
-    rem = ctx->cfg.cbfc_total_buffer_pkts % (uint64_t)ctx->cfg.nb_vc;
-    for (i = 0; i < ctx->cfg.nb_vc; i++) {
-        ctx->vc_cbfc_states[i].buffer_cap = base + ((uint64_t)i < rem ? 1U : 0U);
-        ctx->vc_cbfc_states[i].received = 0U;
+        base = ctx->cfg.cbfc_total_buffer_pkts / (uint64_t)ctx->cfg.nb_vc;
+        rem = ctx->cfg.cbfc_total_buffer_pkts % (uint64_t)ctx->cfg.nb_vc;
+        for (i = 0; i < ctx->cfg.nb_vc; i++) {
+            ctx->vc_cbfc_states[i].buffer_cap = base + ((uint64_t)i < rem ? 1U : 0U);
+            ctx->vc_cbfc_states[i].received = 0U;
+        }
+    } else if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+        ctx->vc_infiniflow_states = calloc(ctx->cfg.nb_vc, sizeof(*ctx->vc_infiniflow_states));
+        if (ctx->vc_infiniflow_states == NULL) {
+            return -1;
+        }
+        ctx->port_infiniflow_state.total_received = 0U;
+        ctx->port_infiniflow_state.total_drained = 0U;
     }
 
     return 0;
@@ -589,7 +634,37 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
                 " new_received=%" PRIu64 " fccl=%" PRIu64 "\n",
                 ctx->cfg.port_id, vc_id, flow_id, vc_state->buffer_cap, old_received, new_received,
                 fccl);
-        receiver_feedback_try_enqueue(ctx, &eth_hdr->src_addr, vc_id, fccl);
+        receiver_feedback_try_enqueue(ctx, &eth_hdr->src_addr, vc_id, fccl, 0U, 0U, 0U);
+    } else if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+        receiver_vc_infiniflow_state_t *vc_state = NULL;
+        uint32_t flags = fc_be32_to_cpu(fc_hdr->flags);
+        uint32_t feedback_flags = 0U;
+        uint64_t fccl = 0;
+
+        if (vc_id >= ctx->cfg.nb_vc) {
+            return 0;
+        }
+
+        vc_state = &ctx->vc_infiniflow_states[vc_id];
+        vc_state->received++;
+        vc_state->drained++;
+        vc_state->backlog = 0U;
+        ctx->port_infiniflow_state.total_received++;
+        ctx->port_infiniflow_state.total_drained++;
+
+        if ((flags & FC_DATA_FLAG_TA) != 0U) {
+            vc_state->state = 1U;
+            vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+        }
+        feedback_flags = vc_state->pending_feedback_flags;
+        vc_state->pending_feedback_flags = 0U;
+        if ((feedback_flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
+            vc_state->state = 0U;
+        }
+
+        fccl = ctx->port_infiniflow_state.total_received + ctx->cfg.port_buffer_pkts;
+        receiver_feedback_try_enqueue(ctx, &eth_hdr->src_addr, vc_id, fccl, vc_state->drained,
+                                      vc_state->backlog, feedback_flags);
     }
 
     return 0;
@@ -734,6 +809,8 @@ static void cleanup_receiver(receiver_ctx_t *ctx) {
 
     free(ctx->vc_cbfc_states);
     ctx->vc_cbfc_states = NULL;
+    free(ctx->vc_infiniflow_states);
+    ctx->vc_infiniflow_states = NULL;
 
     if (ctx->mbuf_pool != NULL) {
         rte_mempool_free(ctx->mbuf_pool);
@@ -756,6 +833,10 @@ static int init_receiver_port_ctx(receiver_ctx_t *ctx, const receiver_app_t *app
     ctx->cfg.mempool_size = app->cfg.mempool_size;
     ctx->cfg.feedback_ring_size = app->cfg.feedback_ring_size;
     ctx->cfg.cbfc_total_buffer_pkts = app->cfg.cbfc_total_buffer_pkts;
+    ctx->cfg.qmin = app->cfg.qmin;
+    ctx->cfg.qmax = app->cfg.qmax;
+    ctx->cfg.initial_threshold = app->cfg.initial_threshold;
+    ctx->cfg.port_buffer_pkts = app->cfg.port_buffer_pkts;
     ctx->cfg.fc_mode = app->cfg.fc_mode;
     ctx->hz = app->hz;
     ctx->start_cycles = app->start_cycles;
@@ -807,7 +888,7 @@ static int init_receiver_port_ctx(receiver_ctx_t *ctx, const receiver_app_t *app
                 ctx->cfg.port_id);
         return -1;
     }
-    if (ctx->cfg.fc_mode == FC_MODE_CBFC && receiver_feedback_init(ctx) != 0) {
+    if (ctx->cfg.fc_mode != FC_MODE_NONE && receiver_feedback_init(ctx) != 0) {
         RTE_LOG(ERR, USER1,
                 "receiver port=%" PRIu16 " feedback init failed: ring_size=%" PRIu32 "\n",
                 ctx->cfg.port_id, ctx->cfg.feedback_ring_size);
@@ -818,7 +899,9 @@ static int init_receiver_port_ctx(receiver_ctx_t *ctx, const receiver_app_t *app
             "receiver port=%" PRIu16 " init ok: mempool=%s count=%" PRIu32
             " packet_size=%" PRIu32 " fc_mode=%s\n",
             ctx->cfg.port_id, ctx->mempool_name, ctx->cfg.mempool_size, ctx->cfg.packet_size,
-            ctx->cfg.fc_mode == FC_MODE_CBFC ? "cbfc" : "none");
+            ctx->cfg.fc_mode == FC_MODE_CBFC
+                ? "cbfc"
+                : (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW ? "infiniflow" : "none"));
 
     return 0;
 }
@@ -853,6 +936,10 @@ int main(int argc, char **argv) {
     app.cfg.mempool_size = DEFAULT_MEMPOOL_SIZE;
     app.cfg.feedback_ring_size = DEFAULT_FEEDBACK_RING_SIZE;
     app.cfg.cbfc_total_buffer_pkts = DEFAULT_CBFC_TOTAL_BUFFER_PKTS;
+    app.cfg.qmin = DEFAULT_INFINIFLOW_QMIN;
+    app.cfg.qmax = DEFAULT_INFINIFLOW_QMAX;
+    app.cfg.initial_threshold = DEFAULT_INFINIFLOW_INITIAL_THRESHOLD;
+    app.cfg.port_buffer_pkts = DEFAULT_INFINIFLOW_PORT_BUFFER_PKTS;
     app.cfg.fc_mode = FC_MODE_NONE;
     app.cfg.output_path = DEFAULT_OUTPUT_PATH;
 
@@ -886,7 +973,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "receiver multi-port allocation failed\n");
         goto out;
     }
-    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+    if (app.cfg.fc_mode != FC_MODE_NONE) {
         feedback_lcores = calloc(app.cfg.nb_ports, sizeof(*feedback_lcores));
         if (feedback_lcores == NULL) {
             fprintf(stderr, "receiver feedback lcore allocation failed\n");
@@ -913,20 +1000,22 @@ int main(int argc, char **argv) {
     }
 
     required_workers = app.cfg.nb_ports;
-    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+    if (app.cfg.fc_mode != FC_MODE_NONE) {
         required_workers = (uint16_t)(required_workers + app.cfg.nb_ports);
     }
     if (nb_workers < required_workers) {
         fprintf(stderr, "Need at least %u worker lcores for %u receiver ports in %s mode\n",
                 required_workers, app.cfg.nb_ports,
-                app.cfg.fc_mode == FC_MODE_CBFC ? "cbfc" : "normal");
+                app.cfg.fc_mode == FC_MODE_CBFC
+                    ? "cbfc"
+                    : (app.cfg.fc_mode == FC_MODE_INFINIFLOW ? "infiniflow" : "normal"));
         goto out;
     }
 
     for (i = 0; i < app.cfg.nb_ports; i++) {
         rx_lcores[i] = worker_ids[worker_cursor++];
     }
-    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+    if (app.cfg.fc_mode != FC_MODE_NONE) {
         for (i = 0; i < app.cfg.nb_ports; i++) {
             feedback_lcores[i] = worker_ids[worker_cursor++];
         }
@@ -939,7 +1028,7 @@ int main(int argc, char **argv) {
         }
         launched_rx++;
     }
-    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+    if (app.cfg.fc_mode != FC_MODE_NONE) {
         for (i = 0; i < app.cfg.nb_ports; i++) {
             if (rte_eal_remote_launch(receiver_feedback_loop, &worker_args[i], feedback_lcores[i]) !=
                 0) {
@@ -955,7 +1044,7 @@ int main(int argc, char **argv) {
         rte_eal_wait_lcore(rx_lcores[i]);
     }
     launched_rx = 0;
-    if (app.cfg.fc_mode == FC_MODE_CBFC) {
+    if (app.cfg.fc_mode != FC_MODE_NONE) {
         for (i = 0; i < launched_feedback; i++) {
             rte_eal_wait_lcore(feedback_lcores[i]);
         }
@@ -973,13 +1062,13 @@ int main(int argc, char **argv) {
         total_feedback_drops += app.port_ctxs[i].feedback_enqueue_drop;
         RTE_LOG(INFO, USER1,
                 "receiver port=%" PRIu16 " exit: received FC data packets=%" PRIu64
-                ", sent CBFC feedback packets=%" PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
+                ", sent feedback packets=%" PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
                 app.port_ctxs[i].cfg.port_id, app.port_ctxs[i].rx_fc_data_pkts,
                 app.port_ctxs[i].tx_cbfc_feedback_pkts, app.port_ctxs[i].feedback_enqueue_drop);
     }
     RTE_LOG(INFO, USER1,
             "receiver total exit: ports=%" PRIu16 ", received FC data packets=%" PRIu64
-            ", sent CBFC feedback packets=%" PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
+            ", sent feedback packets=%" PRIu64 ", feedback enqueue drops=%" PRIu64 "\n",
             app.cfg.nb_ports, total_rx_pkts, total_feedback_tx_pkts, total_feedback_drops);
     ret = EXIT_SUCCESS;
 

@@ -32,26 +32,40 @@ uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx) {
         for (i = 0; i < nb_rx; i++) {
             struct rte_mbuf *mbuf = rx_pkts[i];
             const struct rte_ether_hdr *eth_hdr = NULL;
-            const cbfc_feedback_header_t *fb_hdr = NULL;
+            const cbfc_feedback_header_t *cbfc_hdr = NULL;
+            const infiniflow_feedback_header_t *infi_hdr = NULL;
             uint32_t vc_id = 0;
             uint64_t fccl = 0;
+            uint64_t vc_dr = 0;
+            uint64_t vc_bklg = 0;
+            uint32_t flags = 0;
 
-            if (mbuf->pkt_len < sizeof(struct rte_ether_hdr) + CBFC_FEEDBACK_HEADER_SIZE) {
+            if (mbuf->pkt_len < sizeof(struct rte_ether_hdr)) {
                 rte_pktmbuf_free(mbuf);
                 continue;
             }
 
             eth_hdr = rte_pktmbuf_mtod(mbuf, const struct rte_ether_hdr *);
-            if (eth_hdr->ether_type != rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE)) {
+            if (eth_hdr->ether_type == rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE) &&
+                mbuf->pkt_len >= sizeof(struct rte_ether_hdr) + CBFC_FEEDBACK_HEADER_SIZE) {
+                cbfc_hdr = (const cbfc_feedback_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
+                vc_id = rte_be_to_cpu_32(cbfc_hdr->vc_id);
+                fccl = fc_be64_to_cpu(cbfc_hdr->fccl);
+            } else if (eth_hdr->ether_type == rte_cpu_to_be_16(INFINIFLOW_FEEDBACK_ETHER_TYPE) &&
+                       mbuf->pkt_len >= sizeof(struct rte_ether_hdr) + INFINIFLOW_FEEDBACK_HEADER_SIZE) {
+                infi_hdr = (const infiniflow_feedback_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
+                vc_id = rte_be_to_cpu_32(infi_hdr->vc_id);
+                flags = fc_be32_to_cpu(infi_hdr->flags);
+                vc_dr = fc_be64_to_cpu(infi_hdr->vc_dr);
+                vc_bklg = fc_be64_to_cpu(infi_hdr->vc_bklg);
+                fccl = fc_be64_to_cpu(infi_hdr->fccl);
+            } else {
                 rte_pktmbuf_free(mbuf);
                 continue;
             }
 
-            fb_hdr = (const cbfc_feedback_header_t *)((const char *)eth_hdr + sizeof(*eth_hdr));
-            vc_id = rte_be_to_cpu_32(fb_hdr->vc_id);
             if (vc_id < ctx->cfg.nb_vc && ctx->fc_ops != NULL && ctx->fc_ops->on_feedback_rx != NULL) {
-                fccl = fc_be64_to_cpu(fb_hdr->fccl);
-                ctx->fc_ops->on_feedback_rx(ctx, egress_idx, vc_id, fccl);
+                ctx->fc_ops->on_feedback_rx(ctx, egress_idx, vc_id, fccl, vc_dr, vc_bklg, flags);
                 processed++;
             }
 

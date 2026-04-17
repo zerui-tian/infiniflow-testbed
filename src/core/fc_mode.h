@@ -3,7 +3,8 @@
 
 typedef enum fc_mode_e {
     FC_MODE_NONE = 0,
-    FC_MODE_CBFC = 1
+    FC_MODE_CBFC = 1,
+    FC_MODE_INFINIFLOW = 2
 } fc_mode_t;
 
 #endif

@@ -28,6 +28,10 @@
 #define DEFAULT_RX_BURST 64U
 #define DEFAULT_INITIAL_FCCL 1024U
 #define DEFAULT_VC_CAPACITY 1024U
+#define DEFAULT_INFINIFLOW_QMIN 1U
+#define DEFAULT_INFINIFLOW_QMAX 1U
+#define DEFAULT_INFINIFLOW_INITIAL_THRESHOLD 1U
+#define DEFAULT_INFINIFLOW_PORT_BUFFER_PKTS 1U
 #define MBUF_CACHE_SIZE 256U
 
 static volatile sig_atomic_t g_force_quit = 0;
@@ -104,6 +108,10 @@ static int parse_fc_mode(const char *s, fc_mode_t *mode) {
     }
     if (strcmp(s, "cbfc") == 0) {
         *mode = FC_MODE_CBFC;
+        return 0;
+    }
+    if (strcmp(s, "infiniflow") == 0) {
+        *mode = FC_MODE_INFINIFLOW;
         return 0;
     }
     return -1;
@@ -185,10 +193,14 @@ static void usage(const char *prog) {
     printf("  --mempool <num>         Mempool object count (default: %u)\n", DEFAULT_MEMPOOL_SIZE);
     printf("  --tx-burst <num>        TX burst size (default: %u)\n", DEFAULT_TX_BURST);
     printf("  --rx-burst <num>        RX burst size (default: %u)\n", DEFAULT_RX_BURST);
-    printf("  --fc-mode <mode>        Flow control mode: none|cbfc (default: cbfc)\n");
+    printf("  --fc-mode <mode>        Flow control mode: none|cbfc|infiniflow (default: cbfc)\n");
     printf("  --initial-fccl <num>    Initial FCCL per VC (default: %u)\n", DEFAULT_INITIAL_FCCL);
     printf("  --vc-capacity <num>     Fixed VC capacity in packets (default: %u)\n",
            DEFAULT_VC_CAPACITY);
+    printf("  --qmin <num>            InfiniFlow qmin (default: 1)\n");
+    printf("  --qmax <num>            InfiniFlow qmax (default: 1)\n");
+    printf("  --initial-threshold <num> InfiniFlow initial threshold (default: 1)\n");
+    printf("  --port-buffer-pkts <num>  InfiniFlow shared ingress buffer packets (default: 1)\n");
     printf("  --route-csv <path>      Route CSV with fid,port columns (required)\n");
 }
 
@@ -207,12 +219,16 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
         {"fc-mode", required_argument, 0, 'f'},
         {"initial-fccl", required_argument, 0, 'c'},
         {"vc-capacity", required_argument, 0, 'k'},
+        {"qmin", required_argument, 0, 'n'},
+        {"qmax", required_argument, 0, 'N'},
+        {"initial-threshold", required_argument, 0, 'T'},
+        {"port-buffer-pkts", required_argument, 0, 'B'},
         {"route-csv", required_argument, 0, 'p'},
         {0, 0, 0, 0},
     };
     int opt = 0;
 
-    while ((opt = getopt_long(argc, argv, "i:e:o:v:r:q:s:m:b:x:f:c:k:p:", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:e:o:v:r:q:s:m:b:x:f:c:k:n:N:T:B:p:", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'i':
                 if (parse_ingress_ports(optarg, cfg) != 0) {
@@ -276,6 +292,26 @@ static int parse_app_args(int argc, char **argv, switch_config_t *cfg) {
                 break;
             case 'k':
                 if (parse_u64(optarg, &cfg->vc_capacity_pkts) != 0) {
+                    return -1;
+                }
+                break;
+            case 'n':
+                if (parse_u64(optarg, &cfg->qmin) != 0) {
+                    return -1;
+                }
+                break;
+            case 'N':
+                if (parse_u64(optarg, &cfg->qmax) != 0) {
+                    return -1;
+                }
+                break;
+            case 'T':
+                if (parse_u64(optarg, &cfg->initial_threshold) != 0) {
+                    return -1;
+                }
+                break;
+            case 'B':
+                if (parse_u64(optarg, &cfg->port_buffer_pkts) != 0) {
                     return -1;
                 }
                 break;
@@ -444,18 +480,25 @@ static int init_ingress_vc_states(switch_ctx_t *ctx) {
     uint32_t vc_id = 0;
     size_t nb_states = (size_t)ctx->cfg.nb_ingress_ports * ctx->cfg.nb_vc;
 
+    ctx->ingress_port_states = calloc(ctx->cfg.nb_ingress_ports, sizeof(*ctx->ingress_port_states));
     ctx->ingress_vc_states = calloc(nb_states, sizeof(*ctx->ingress_vc_states));
-    if (ctx->ingress_vc_states == NULL) {
+    if (ctx->ingress_port_states == NULL || ctx->ingress_vc_states == NULL) {
         return -1;
     }
 
     for (ingress_idx = 0; ingress_idx < ctx->cfg.nb_ingress_ports; ingress_idx++) {
+        ctx->ingress_port_states[ingress_idx].occupancy = 0U;
+        ctx->ingress_port_states[ingress_idx].total_received = 0U;
+        ctx->ingress_port_states[ingress_idx].total_drained = 0U;
         for (vc_id = 0; vc_id < ctx->cfg.nb_vc; vc_id++) {
             size_t state_idx = switch_ingress_vc_state_index(ctx, ingress_idx, vc_id);
 
             ctx->ingress_vc_states[state_idx].occupancy = 0U;
             ctx->ingress_vc_states[state_idx].capacity = ctx->cfg.vc_capacity_pkts;
             ctx->ingress_vc_states[state_idx].total_received = 0U;
+            ctx->ingress_vc_states[state_idx].total_drained = 0U;
+            ctx->ingress_vc_states[state_idx].state = 0U;
+            ctx->ingress_vc_states[state_idx].pending_feedback_flags = 0U;
         }
     }
 
@@ -467,17 +510,25 @@ static int init_egress_vc_states(switch_ctx_t *ctx) {
     uint32_t vc_id = 0;
     size_t nb_states = (size_t)ctx->cfg.nb_egress_ports * ctx->cfg.nb_vc;
 
+    ctx->egress_port_states = calloc(ctx->cfg.nb_egress_ports, sizeof(*ctx->egress_port_states));
     ctx->egress_vc_states = calloc(nb_states, sizeof(*ctx->egress_vc_states));
-    if (ctx->egress_vc_states == NULL) {
+    if (ctx->egress_port_states == NULL || ctx->egress_vc_states == NULL) {
         return -1;
     }
 
     for (egress_idx = 0; egress_idx < ctx->cfg.nb_egress_ports; egress_idx++) {
+        ctx->egress_port_states[egress_idx].fccl = ctx->cfg.initial_fccl;
+        ctx->egress_port_states[egress_idx].fctbs = 0U;
         for (vc_id = 0; vc_id < ctx->cfg.nb_vc; vc_id++) {
             size_t state_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
 
             ctx->egress_vc_states[state_idx].fccl = ctx->cfg.initial_fccl;
             ctx->egress_vc_states[state_idx].fctbs = 0U;
+            ctx->egress_vc_states[state_idx].tx_pkts = 0U;
+            ctx->egress_vc_states[state_idx].vc_dr = 0U;
+            ctx->egress_vc_states[state_idx].vc_bklg = 0U;
+            ctx->egress_vc_states[state_idx].threshold = ctx->cfg.initial_threshold;
+            ctx->egress_vc_states[state_idx].state = 0U;
         }
     }
 
@@ -504,57 +555,170 @@ static int init_feedback_stats(switch_ctx_t *ctx) {
     return 0;
 }
 
-static uint64_t cbfc_calc_credit(const switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id) {
+static uint32_t cbfc_calc_deq_limit(const switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id,
+                                    uint32_t burst_size) {
     const switch_egress_vc_state_t *state =
         &ctx->egress_vc_states[switch_egress_vc_state_index(ctx, egress_idx, vc_id)];
     uint64_t fccl = __atomic_load_n(&state->fccl, __ATOMIC_ACQUIRE);
     uint64_t fctbs = __atomic_load_n(&state->fctbs, __ATOMIC_RELAXED);
-    return (fccl > fctbs) ? (fccl - fctbs) : 0U;
+    uint64_t credit = (fccl > fctbs) ? (fccl - fctbs) : 0U;
+
+    if (credit == 0U) {
+        return 0U;
+    }
+    return (credit < burst_size) ? (uint32_t)credit : burst_size;
 }
 
-static void cbfc_on_feedback_rx(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl) {
+static void cbfc_on_feedback_rx(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl,
+                                uint64_t vc_dr, uint64_t vc_bklg, uint32_t flags) {
     size_t state_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
 
+    (void)vc_dr;
+    (void)vc_bklg;
+    (void)flags;
     __atomic_store_n(&ctx->egress_vc_states[state_idx].fccl, fccl, __ATOMIC_RELEASE);
 }
 
-static uint64_t release_ingress_credit(switch_ingress_vc_state_t *state) {
-    uint64_t occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_ACQUIRE);
-
-    while (occupancy > 0U) {
-        if (__atomic_compare_exchange_n(&state->occupancy, &occupancy, occupancy - 1U, false,
-                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            break;
-        }
-    }
-
-    occupancy = __atomic_load_n(&state->occupancy, __ATOMIC_ACQUIRE);
-    return __atomic_load_n(&state->total_received, __ATOMIC_RELAXED) +
-           ((state->capacity > occupancy) ? (state->capacity - occupancy) : 0U);
+static void cbfc_on_tx_prepare(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id, fc_data_header_t *fc_hdr) {
+    (void)ctx;
+    (void)egress_idx;
+    (void)vc_id;
+    (void)fc_hdr;
 }
 
-static uint64_t cbfc_on_tx_success(switch_ctx_t *ctx, uint16_t ingress_idx, uint16_t egress_idx,
-                                   uint32_t vc_id) {
+static void cbfc_on_tx_success(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id, uint32_t pkt_count,
+                               bool ta_sent) {
     size_t egress_state_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);
     switch_egress_vc_state_t *egress_state = &ctx->egress_vc_states[egress_state_idx];
 
-    __atomic_fetch_add(&egress_state->fctbs, 1U, __ATOMIC_RELAXED);
-    if (ingress_idx >= ctx->cfg.nb_ingress_ports) {
-        return 0U;
-    }
-
-    return release_ingress_credit(
-        &ctx->ingress_vc_states[switch_ingress_vc_state_index(ctx, ingress_idx, vc_id)]);
+    (void)ta_sent;
+    __atomic_fetch_add(&egress_state->fctbs, pkt_count, __ATOMIC_RELAXED);
 }
 
 void switch_cbfc_ops_init(switch_ctx_t *ctx) {
     static const switch_fc_ops_t cbfc_ops = {
-        .calc_credit = cbfc_calc_credit,
+        .calc_deq_limit = cbfc_calc_deq_limit,
         .on_feedback_rx = cbfc_on_feedback_rx,
+        .on_tx_prepare = cbfc_on_tx_prepare,
         .on_tx_success = cbfc_on_tx_success,
     };
 
     ctx->fc_ops = &cbfc_ops;
+}
+
+static uint32_t infiniflow_calc_deq_limit(const switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id,
+                                          uint32_t burst_size) {
+    const switch_egress_port_state_t *port_state = &ctx->egress_port_states[egress_idx];
+    const switch_egress_vc_state_t *vc_state =
+        &ctx->egress_vc_states[switch_egress_vc_state_index(ctx, egress_idx, vc_id)];
+    uint64_t port_fccl = __atomic_load_n(&port_state->fccl, __ATOMIC_ACQUIRE);
+    uint64_t port_fctbs = __atomic_load_n(&port_state->fctbs, __ATOMIC_RELAXED);
+    uint64_t threshold = __atomic_load_n(&vc_state->threshold, __ATOMIC_ACQUIRE);
+    uint64_t tx_pkts = __atomic_load_n(&vc_state->tx_pkts, __ATOMIC_RELAXED);
+    uint64_t vc_dr = __atomic_load_n(&vc_state->vc_dr, __ATOMIC_RELAXED);
+    uint64_t credit_pool = (port_fccl > port_fctbs) ? (port_fccl - port_fctbs) : 0U;
+    uint64_t inflight = (tx_pkts > vc_dr) ? (tx_pkts - vc_dr) : 0U;
+    uint64_t vc_credit = (threshold > inflight) ? (threshold - inflight) : 0U;
+    uint32_t limit = burst_size;
+
+    if (credit_pool == 0U || vc_credit == 0U) {
+        return 0U;
+    }
+    if (credit_pool < (uint64_t)limit) {
+        limit = (uint32_t)credit_pool;
+    }
+    if (vc_credit < (uint64_t)limit) {
+        limit = (uint32_t)vc_credit;
+    }
+    return limit;
+}
+
+static void infiniflow_on_feedback_rx(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl,
+                                      uint64_t vc_dr, uint64_t vc_bklg, uint32_t flags) {
+    switch_egress_port_state_t *port_state = &ctx->egress_port_states[egress_idx];
+    switch_egress_vc_state_t *vc_state =
+        &ctx->egress_vc_states[switch_egress_vc_state_index(ctx, egress_idx, vc_id)];
+    uint64_t tx_pkts = 0;
+    uint64_t inflight = 0;
+    uint64_t threshold = 0;
+    uint64_t port_fctbs = 0;
+    uint64_t limit = 1U;
+
+    __atomic_store_n(&port_state->fccl, fccl, __ATOMIC_RELEASE);
+    __atomic_store_n(&vc_state->vc_dr, vc_dr, __ATOMIC_RELEASE);
+    __atomic_store_n(&vc_state->vc_bklg, vc_bklg, __ATOMIC_RELEASE);
+
+    if ((flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U &&
+        __atomic_load_n(&vc_state->state, __ATOMIC_ACQUIRE) == 2U) {
+        __atomic_store_n(&vc_state->state, 0U, __ATOMIC_RELEASE);
+    }
+
+    if (__atomic_load_n(&vc_state->state, __ATOMIC_ACQUIRE) != 0U) {
+        return;
+    }
+
+    tx_pkts = __atomic_load_n(&vc_state->tx_pkts, __ATOMIC_RELAXED);
+    threshold = __atomic_load_n(&vc_state->threshold, __ATOMIC_RELAXED);
+    inflight = (tx_pkts > vc_dr) ? (tx_pkts - vc_dr) : 0U;
+    port_fctbs = __atomic_load_n(&port_state->fctbs, __ATOMIC_RELAXED);
+
+    if (vc_bklg >= ctx->cfg.qmax) {
+        uint64_t reduction = vc_bklg - ctx->cfg.qmin;
+        uint64_t new_threshold = (inflight > reduction) ? (inflight - reduction) : 1U;
+
+        __atomic_store_n(&vc_state->threshold, new_threshold, __ATOMIC_RELEASE);
+        __atomic_store_n(&vc_state->state, 1U, __ATOMIC_RELEASE);
+    } else if (vc_bklg < ctx->cfg.qmin) {
+        uint64_t headroom = (fccl > port_fctbs) ? (fccl - port_fctbs) : 1U;
+        uint64_t increase = ctx->cfg.qmin - vc_bklg;
+        uint64_t new_threshold = threshold + increase;
+
+        limit = (headroom > 0U) ? headroom : 1U;
+        if (new_threshold > limit) {
+            new_threshold = limit;
+        }
+        if (new_threshold == 0U) {
+            new_threshold = 1U;
+        }
+        __atomic_store_n(&vc_state->threshold, new_threshold, __ATOMIC_RELEASE);
+        __atomic_store_n(&vc_state->state, 1U, __ATOMIC_RELEASE);
+    }
+}
+
+static void infiniflow_on_tx_prepare(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id,
+                                     fc_data_header_t *fc_hdr) {
+    switch_egress_vc_state_t *vc_state =
+        &ctx->egress_vc_states[switch_egress_vc_state_index(ctx, egress_idx, vc_id)];
+    uint32_t flags = fc_be32_to_cpu(fc_hdr->flags);
+
+    if (__atomic_load_n(&vc_state->state, __ATOMIC_ACQUIRE) == 1U) {
+        flags |= FC_DATA_FLAG_TA;
+    }
+    fc_hdr->flags = fc_cpu_to_be32(flags);
+}
+
+static void infiniflow_on_tx_success(switch_ctx_t *ctx, uint16_t egress_idx, uint32_t vc_id,
+                                     uint32_t pkt_count, bool ta_sent) {
+    switch_egress_port_state_t *port_state = &ctx->egress_port_states[egress_idx];
+    switch_egress_vc_state_t *vc_state =
+        &ctx->egress_vc_states[switch_egress_vc_state_index(ctx, egress_idx, vc_id)];
+
+    __atomic_fetch_add(&port_state->fctbs, pkt_count, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&vc_state->tx_pkts, pkt_count, __ATOMIC_RELAXED);
+    if (ta_sent) {
+        __atomic_store_n(&vc_state->state, 2U, __ATOMIC_RELEASE);
+    }
+}
+
+void switch_infiniflow_ops_init(switch_ctx_t *ctx) {
+    static const switch_fc_ops_t infiniflow_ops = {
+        .calc_deq_limit = infiniflow_calc_deq_limit,
+        .on_feedback_rx = infiniflow_on_feedback_rx,
+        .on_tx_prepare = infiniflow_on_tx_prepare,
+        .on_tx_success = infiniflow_on_tx_success,
+    };
+
+    ctx->fc_ops = &infiniflow_ops;
 }
 
 static int scheduler_loop(void *arg) {
@@ -650,7 +814,9 @@ static void cleanup_switch(switch_ctx_t *ctx) {
     free(ctx->feedback_stats);
     free(ctx->vc_stats);
     free(ctx->egress_vc_states);
+    free(ctx->egress_port_states);
     free(ctx->ingress_vc_states);
+    free(ctx->ingress_port_states);
     free(ctx->feedback_queues);
     free(ctx->feedback_free_queues);
     free(ctx->egress_vc_queues);
@@ -682,6 +848,10 @@ int main(int argc, char **argv) {
     ctx.cfg.rx_burst_size = DEFAULT_RX_BURST;
     ctx.cfg.initial_fccl = DEFAULT_INITIAL_FCCL;
     ctx.cfg.vc_capacity_pkts = DEFAULT_VC_CAPACITY;
+    ctx.cfg.qmin = DEFAULT_INFINIFLOW_QMIN;
+    ctx.cfg.qmax = DEFAULT_INFINIFLOW_QMAX;
+    ctx.cfg.initial_threshold = DEFAULT_INFINIFLOW_INITIAL_THRESHOLD;
+    ctx.cfg.port_buffer_pkts = DEFAULT_INFINIFLOW_PORT_BUFFER_PKTS;
     ctx.cfg.fc_mode = FC_MODE_CBFC;
     ctx.cfg.ingress_rx_queue_id = 0;
     ctx.cfg.ingress_tx_queue_id = 0;
@@ -761,6 +931,8 @@ int main(int argc, char **argv) {
 
     if (ctx.cfg.fc_mode == FC_MODE_CBFC) {
         switch_cbfc_ops_init(&ctx);
+    } else if (ctx.cfg.fc_mode == FC_MODE_INFINIFLOW) {
+        switch_infiniflow_ops_init(&ctx);
     }
 
     ingress_worker_args = calloc(ctx.cfg.nb_ingress_ports, sizeof(*ingress_worker_args));

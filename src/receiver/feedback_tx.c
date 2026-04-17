@@ -81,7 +81,8 @@ void receiver_feedback_cleanup(receiver_ctx_t *ctx) {
 }
 
 void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_addr *dst_addr,
-                                   uint32_t vc_id, uint64_t fccl) {
+                                   uint32_t vc_id, uint64_t fccl, uint64_t vc_dr,
+                                   uint64_t vc_bklg, uint32_t flags) {
     receiver_feedback_msg_t *msg = NULL;
 
     if (ctx->feedback_ring == NULL || ctx->feedback_free_ring == NULL) {
@@ -95,6 +96,9 @@ void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_a
 
     msg->vc_id = vc_id;
     msg->fccl = fccl;
+    msg->vc_dr = vc_dr;
+    msg->vc_bklg = vc_bklg;
+    msg->flags = flags;
     rte_ether_addr_copy(dst_addr, &msg->dst_addr);
 
     if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
@@ -122,7 +126,9 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
         struct rte_mbuf *mbuf = NULL;
         char *packet = NULL;
         struct rte_ether_hdr *eth_hdr = NULL;
-        cbfc_feedback_header_t *fb_hdr = NULL;
+        cbfc_feedback_header_t *cbfc_hdr = NULL;
+        infiniflow_feedback_header_t *infi_hdr = NULL;
+        uint32_t packet_len = sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE;
 
         if (rte_ring_sc_dequeue(ctx->feedback_ring, (void **)&msg) != 0) {
             break;
@@ -139,7 +145,11 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
             break;
         }
 
-        packet = rte_pktmbuf_append(mbuf, sizeof(*eth_hdr) + CBFC_FEEDBACK_HEADER_SIZE);
+        if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+            packet_len = sizeof(*eth_hdr) + INFINIFLOW_FEEDBACK_HEADER_SIZE;
+        }
+
+        packet = rte_pktmbuf_append(mbuf, packet_len);
         if (packet == NULL) {
             rte_pktmbuf_free(mbuf);
             if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
@@ -152,12 +162,22 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
         }
 
         eth_hdr = (struct rte_ether_hdr *)packet;
-        fb_hdr = (cbfc_feedback_header_t *)(packet + sizeof(*eth_hdr));
         rte_ether_addr_copy(&msg->dst_addr, &eth_hdr->dst_addr);
         rte_ether_addr_copy(&ctx->port_mac, &eth_hdr->src_addr);
-        eth_hdr->ether_type = rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE);
-        fb_hdr->vc_id = rte_cpu_to_be_32(msg->vc_id);
-        fb_hdr->fccl = fc_cpu_to_be64(msg->fccl);
+        if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
+            infi_hdr = (infiniflow_feedback_header_t *)(packet + sizeof(*eth_hdr));
+            eth_hdr->ether_type = rte_cpu_to_be_16(INFINIFLOW_FEEDBACK_ETHER_TYPE);
+            infi_hdr->vc_id = rte_cpu_to_be_32(msg->vc_id);
+            infi_hdr->flags = fc_cpu_to_be32(msg->flags);
+            infi_hdr->vc_dr = fc_cpu_to_be64(msg->vc_dr);
+            infi_hdr->vc_bklg = fc_cpu_to_be64(msg->vc_bklg);
+            infi_hdr->fccl = fc_cpu_to_be64(msg->fccl);
+        } else {
+            cbfc_hdr = (cbfc_feedback_header_t *)(packet + sizeof(*eth_hdr));
+            eth_hdr->ether_type = rte_cpu_to_be_16(CBFC_FEEDBACK_ETHER_TYPE);
+            cbfc_hdr->vc_id = rte_cpu_to_be_32(msg->vc_id);
+            cbfc_hdr->fccl = fc_cpu_to_be64(msg->fccl);
+        }
         tx_pkts[prepared] = mbuf;
         tx_msgs[prepared] = msg;
         prepared++;

@@ -10,6 +10,7 @@
 #include <rte_mempool.h>
 #include <rte_ring.h>
 
+#include "core/fc_header.h"
 #include "core/fc_mode.h"
 #include "core/vc_ring.h"
 
@@ -21,16 +22,38 @@ typedef struct switch_ingress_vc_state_s {
     uint64_t occupancy;
     uint64_t capacity;
     uint64_t total_received;
+    uint64_t total_drained;
+    uint32_t state;
+    uint32_t pending_feedback_flags;
 } switch_ingress_vc_state_t;
 
 typedef struct switch_egress_vc_state_s {
     uint64_t fccl;
     uint64_t fctbs;
+    uint64_t tx_pkts;
+    uint64_t vc_dr;
+    uint64_t vc_bklg;
+    uint64_t threshold;
+    uint32_t state;
 } switch_egress_vc_state_t;
+
+typedef struct switch_ingress_port_state_s {
+    uint64_t occupancy;
+    uint64_t total_received;
+    uint64_t total_drained;
+} switch_ingress_port_state_t;
+
+typedef struct switch_egress_port_state_s {
+    uint64_t fccl;
+    uint64_t fctbs;
+} switch_egress_port_state_t;
 
 typedef struct switch_feedback_msg_s {
     uint32_t vc_id;
     uint64_t fccl;
+    uint64_t vc_dr;
+    uint64_t vc_bklg;
+    uint32_t flags;
     struct rte_ether_addr dst_addr;
 } switch_feedback_msg_t;
 
@@ -56,10 +79,14 @@ typedef struct switch_route_table_s {
 
 struct switch_ctx_s;
 typedef struct switch_fc_ops_s {
-    uint64_t (*calc_credit)(const struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id);
-    void (*on_feedback_rx)(struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl);
-    uint64_t (*on_tx_success)(struct switch_ctx_s *ctx, uint16_t ingress_idx, uint16_t egress_idx,
-                              uint32_t vc_id);
+    uint32_t (*calc_deq_limit)(const struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id,
+                               uint32_t burst_size);
+    void (*on_feedback_rx)(struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id, uint64_t fccl,
+                           uint64_t vc_dr, uint64_t vc_bklg, uint32_t flags);
+    void (*on_tx_prepare)(struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id,
+                          fc_data_header_t *fc_hdr);
+    void (*on_tx_success)(struct switch_ctx_s *ctx, uint16_t egress_idx, uint32_t vc_id,
+                          uint32_t pkt_count, bool ta_sent);
 } switch_fc_ops_t;
 
 typedef struct switch_config_s {
@@ -80,6 +107,10 @@ typedef struct switch_config_s {
     uint32_t rx_burst_size;
     uint64_t initial_fccl;
     uint64_t vc_capacity_pkts;
+    uint64_t qmin;
+    uint64_t qmax;
+    uint64_t initial_threshold;
+    uint64_t port_buffer_pkts;
     fc_mode_t fc_mode;
     char route_csv_path[SWITCH_MAX_ROUTE_CSV_PATH];
 } switch_config_t;
@@ -92,7 +123,9 @@ typedef struct switch_ctx_s {
     vc_queue_t *egress_vc_queues;
     struct rte_ring **feedback_queues;
     struct rte_ring **feedback_free_queues;
+    switch_ingress_port_state_t *ingress_port_states;
     switch_ingress_vc_state_t *ingress_vc_states;
+    switch_egress_port_state_t *egress_port_states;
     switch_egress_vc_state_t *egress_vc_states;
     switch_feedback_msg_t *feedback_pool;
 
@@ -116,6 +149,7 @@ uint16_t switch_egress_index_from_port(const switch_ctx_t *ctx, uint16_t port_id
 uint16_t switch_ingress_index_from_port(const switch_ctx_t *ctx, uint16_t port_id);
 
 void switch_cbfc_ops_init(switch_ctx_t *ctx);
+void switch_infiniflow_ops_init(switch_ctx_t *ctx);
 
 static inline size_t switch_ingress_vc_state_index(const switch_ctx_t *ctx, uint16_t ingress_idx,
                                                    uint32_t vc_id) {
