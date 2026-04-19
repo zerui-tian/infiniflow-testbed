@@ -475,6 +475,9 @@ static int init_vc_cbfc_states(receiver_ctx_t *ctx) {
         if (ctx->vc_infiniflow_states == NULL) {
             return -1;
         }
+        for (i = 0; i < ctx->cfg.nb_vc; i++) {
+            rte_spinlock_init(&ctx->vc_infiniflow_states[i].pending_feedback_lock);
+        }
         ctx->port_infiniflow_state.total_received = 0U;
         ctx->port_infiniflow_state.total_drained = 0U;
     }
@@ -638,7 +641,6 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
     } else if (ctx->cfg.fc_mode == FC_MODE_INFINIFLOW) {
         receiver_vc_infiniflow_state_t *vc_state = NULL;
         uint32_t flags = fc_be32_to_cpu(fc_hdr->flags);
-        uint32_t feedback_flags = 0U;
         uint64_t fccl = 0;
 
         if (vc_id >= ctx->cfg.nb_vc) {
@@ -653,18 +655,12 @@ static int process_one_packet(receiver_ctx_t *ctx, struct rte_mbuf *mbuf) {
         ctx->port_infiniflow_state.total_drained++;
 
         if ((flags & FC_DATA_FLAG_TA) != 0U) {
-            vc_state->state = 1U;
-            vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
-        }
-        feedback_flags = vc_state->pending_feedback_flags;
-        vc_state->pending_feedback_flags = 0U;
-        if ((feedback_flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
-            vc_state->state = 0U;
+            receiver_feedback_note_ta(ctx, vc_id);
         }
 
         fccl = ctx->port_infiniflow_state.total_received + ctx->cfg.port_buffer_pkts;
         receiver_feedback_try_enqueue(ctx, &eth_hdr->src_addr, vc_id, fccl, vc_state->drained,
-                                      vc_state->backlog, feedback_flags);
+                                      vc_state->backlog, 0U);
     }
 
     return 0;

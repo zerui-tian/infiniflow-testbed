@@ -7,10 +7,109 @@
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
+static switch_ingress_vc_state_t *switch_get_ingress_vc_state(switch_ctx_t *ctx,
+                                                              uint16_t ingress_idx,
+                                                              uint32_t vc_id) {
+    if (ingress_idx >= ctx->cfg.nb_ingress_ports || vc_id >= ctx->cfg.nb_vc) {
+        return NULL;
+    }
+
+    return &ctx->ingress_vc_states[switch_ingress_vc_state_index(ctx, ingress_idx, vc_id)];
+}
+
+static void switch_feedback_append_pending_locked(switch_ingress_vc_state_t *vc_state,
+                                                  switch_feedback_msg_t *msg) {
+    msg->pending_next = NULL;
+    if (vc_state->pending_feedback_tail == NULL) {
+        vc_state->pending_feedback_head = msg;
+        vc_state->pending_feedback_tail = msg;
+        return;
+    }
+
+    vc_state->pending_feedback_tail->pending_next = msg;
+    vc_state->pending_feedback_tail = msg;
+}
+
+static void switch_feedback_detach_pending_locked(switch_ingress_vc_state_t *vc_state,
+                                                  switch_feedback_msg_t *msg) {
+    switch_feedback_msg_t *prev = NULL;
+    switch_feedback_msg_t *cur = vc_state->pending_feedback_head;
+
+    while (cur != NULL) {
+        if (cur == msg) {
+            if (prev == NULL) {
+                vc_state->pending_feedback_head = cur->pending_next;
+            } else {
+                prev->pending_next = cur->pending_next;
+            }
+            if (vc_state->pending_feedback_tail == cur) {
+                vc_state->pending_feedback_tail = prev;
+            }
+            cur->pending_next = NULL;
+            return;
+        }
+        prev = cur;
+        cur = cur->pending_next;
+    }
+}
+
+static void switch_feedback_bind_pending_flags_locked(switch_ingress_vc_state_t *vc_state,
+                                                      switch_feedback_msg_t *msg) {
+    uint32_t pending_flags = vc_state->pending_feedback_flags;
+
+    if (pending_flags == 0U) {
+        return;
+    }
+
+    if (vc_state->pending_feedback_head != NULL) {
+        vc_state->pending_feedback_head->flags |= pending_flags;
+    } else {
+        msg->flags |= pending_flags;
+    }
+
+    vc_state->pending_feedback_flags = 0U;
+    if ((pending_flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
+        vc_state->state = 0U;
+    }
+}
+
+static void switch_feedback_restore_pending_locked(switch_ingress_vc_state_t *vc_state,
+                                                   switch_feedback_msg_t *msg, bool requeued) {
+    if (requeued) {
+        switch_feedback_append_pending_locked(vc_state, msg);
+        return;
+    }
+
+    if ((msg->flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
+        vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+        vc_state->state = 1U;
+        msg->flags &= ~INFINIFLOW_FEEDBACK_FLAG_TA;
+    }
+}
+
+void switch_feedback_note_ta(switch_ctx_t *ctx, uint16_t ingress_idx, uint32_t vc_id) {
+    switch_ingress_vc_state_t *vc_state = switch_get_ingress_vc_state(ctx, ingress_idx, vc_id);
+
+    if (vc_state == NULL) {
+        return;
+    }
+
+    rte_spinlock_lock(&vc_state->pending_feedback_lock);
+    vc_state->state = 1U;
+    if (vc_state->pending_feedback_head != NULL) {
+        vc_state->pending_feedback_head->flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+        vc_state->state = 0U;
+    } else {
+        vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+    }
+    rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+}
+
 static void enqueue_feedback_msg(switch_ctx_t *ctx, uint16_t ingress_idx, uint32_t vc_id,
                                  uint64_t fccl, uint64_t vc_dr, uint64_t vc_bklg, uint32_t flags,
                                  const struct rte_ether_addr *dst_addr) {
     switch_feedback_msg_t *msg = NULL;
+    switch_ingress_vc_state_t *vc_state = NULL;
 
     if (ingress_idx >= ctx->cfg.nb_ingress_ports) {
         return;
@@ -25,8 +124,22 @@ static void enqueue_feedback_msg(switch_ctx_t *ctx, uint16_t ingress_idx, uint32
     msg->vc_dr = vc_dr;
     msg->vc_bklg = vc_bklg;
     msg->flags = flags;
+    msg->pending_next = NULL;
     rte_ether_addr_copy(dst_addr, &msg->dst_addr);
+    vc_state = switch_get_ingress_vc_state(ctx, ingress_idx, vc_id);
+    if (vc_state != NULL) {
+        rte_spinlock_lock(&vc_state->pending_feedback_lock);
+        switch_feedback_bind_pending_flags_locked(vc_state, msg);
+        switch_feedback_append_pending_locked(vc_state, msg);
+        rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+    }
     if (rte_ring_mp_enqueue(ctx->feedback_queues[ingress_idx], msg) != 0) {
+        if (vc_state != NULL) {
+            rte_spinlock_lock(&vc_state->pending_feedback_lock);
+            switch_feedback_detach_pending_locked(vc_state, msg);
+            switch_feedback_restore_pending_locked(vc_state, msg, false);
+            rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+        }
         rte_ring_mp_enqueue(ctx->feedback_free_queues[ingress_idx], msg);
         __atomic_fetch_add(&ctx->feedback_stats[ingress_idx].drop_queue_full_pkts, 1U, __ATOMIC_RELAXED);
         return;
@@ -36,8 +149,7 @@ static void enqueue_feedback_msg(switch_ctx_t *ctx, uint16_t ingress_idx, uint32
 }
 
 static uint64_t release_ingress_credit(switch_ctx_t *ctx, uint16_t ingress_idx, uint32_t vc_id,
-                                       uint64_t *vc_dr_out, uint64_t *vc_bklg_out,
-                                       uint32_t *flags_out) {
+                                       uint64_t *vc_dr_out, uint64_t *vc_bklg_out) {
     switch_ingress_vc_state_t *vc_state = NULL;
     switch_ingress_port_state_t *port_state = NULL;
     uint64_t occupancy = 0;
@@ -76,12 +188,6 @@ static uint64_t release_ingress_credit(switch_ctx_t *ctx, uint16_t ingress_idx, 
         if (vc_bklg_out != NULL) {
             *vc_bklg_out = occupancy;
         }
-        if (flags_out != NULL) {
-            *flags_out = __atomic_exchange_n(&vc_state->pending_feedback_flags, 0U, __ATOMIC_ACQ_REL);
-            if ((*flags_out & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
-                __atomic_store_n(&vc_state->state, 0U, __ATOMIC_RELEASE);
-            }
-        }
 
         __atomic_fetch_add(&port_state->total_drained, 1U, __ATOMIC_RELAXED);
         fccl = __atomic_load_n(&port_state->total_received, __ATOMIC_RELAXED) +
@@ -95,9 +201,6 @@ static uint64_t release_ingress_credit(switch_ctx_t *ctx, uint16_t ingress_idx, 
     }
     if (vc_bklg_out != NULL) {
         *vc_bklg_out = 0U;
-    }
-    if (flags_out != NULL) {
-        *flags_out = 0U;
     }
     return __atomic_load_n(&vc_state->total_received, __ATOMIC_RELAXED) +
            ((vc_state->capacity > occupancy) ? (vc_state->capacity - occupancy) : 0U);
@@ -148,17 +251,16 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx, uint16_t egress_idx) {
                     uint64_t feedback_fccl = 0;
                     uint64_t feedback_vc_dr = 0;
                     uint64_t feedback_vc_bklg = 0;
-                    uint32_t feedback_flags = 0;
 
                     feedback_fccl = release_ingress_credit(ctx, ingress_idx, vc_id, &feedback_vc_dr,
-                                                           &feedback_vc_bklg, &feedback_flags);
+                                                           &feedback_vc_bklg);
 
                     __atomic_fetch_add(
                         &ctx->vc_stats[switch_ingress_vc_state_index(ctx, ingress_idx, vc_id)].drop_other_pkts,
                         1U, __ATOMIC_RELAXED);
                     if (ctx->cfg.fc_mode != FC_MODE_NONE) {
                         enqueue_feedback_msg(ctx, ingress_idx, vc_id, feedback_fccl, feedback_vc_dr,
-                                             feedback_vc_bklg, feedback_flags, &invalid_eth_hdr->src_addr);
+                                             feedback_vc_bklg, 0U, &invalid_eth_hdr->src_addr);
                     }
                 }
                 rte_pktmbuf_free(mbuf);
@@ -209,14 +311,13 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx, uint16_t egress_idx) {
                 uint64_t feedback_fccl = 0;
                 uint64_t feedback_vc_dr = 0;
                 uint64_t feedback_vc_bklg = 0;
-                uint32_t feedback_flags = 0;
 
                 if (ingress_idx < ctx->cfg.nb_ingress_ports) {
                     feedback_fccl = release_ingress_credit(ctx, ingress_idx, vc_id, &feedback_vc_dr,
-                                                           &feedback_vc_bklg, &feedback_flags);
+                                                           &feedback_vc_bklg);
                     if (ctx->cfg.fc_mode != FC_MODE_NONE) {
                         enqueue_feedback_msg(ctx, ingress_idx, vc_id, feedback_fccl, feedback_vc_dr,
-                                             feedback_vc_bklg, feedback_flags, &feedback_dst_addrs[k]);
+                                             feedback_vc_bklg, 0U, &feedback_dst_addrs[k]);
                     }
                 }
 
@@ -236,11 +337,10 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx, uint16_t egress_idx) {
                     uint16_t ingress_idx = candidate_ingress_idxs[k];
                     uint64_t feedback_vc_dr = 0;
                     uint64_t feedback_vc_bklg = 0;
-                    uint32_t feedback_flags = 0;
 
                     if (ingress_idx < ctx->cfg.nb_ingress_ports) {
                         uint64_t feedback_fccl = release_ingress_credit(ctx, ingress_idx, vc_id, &feedback_vc_dr,
-                                                                       &feedback_vc_bklg, &feedback_flags);
+                                                                       &feedback_vc_bklg);
 
                         __atomic_fetch_add(
                             &ctx->vc_stats[switch_ingress_vc_state_index(ctx, ingress_idx, vc_id)]
@@ -248,7 +348,7 @@ uint32_t switch_forward_run_tick(switch_ctx_t *ctx, uint16_t egress_idx) {
                             1U, __ATOMIC_RELAXED);
                         if (ctx->cfg.fc_mode != FC_MODE_NONE) {
                             enqueue_feedback_msg(ctx, ingress_idx, vc_id, feedback_fccl, feedback_vc_dr,
-                                                 feedback_vc_bklg, feedback_flags, &feedback_dst_addrs[k]);
+                                                 feedback_vc_bklg, 0U, &feedback_dst_addrs[k]);
                         }
                     }
                 }

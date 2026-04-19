@@ -499,6 +499,7 @@ static int init_ingress_vc_states(switch_ctx_t *ctx) {
             ctx->ingress_vc_states[state_idx].total_drained = 0U;
             ctx->ingress_vc_states[state_idx].state = 0U;
             ctx->ingress_vc_states[state_idx].pending_feedback_flags = 0U;
+            rte_spinlock_init(&ctx->ingress_vc_states[state_idx].pending_feedback_lock);
         }
     }
 

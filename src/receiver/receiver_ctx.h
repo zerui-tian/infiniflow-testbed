@@ -8,6 +8,7 @@
 #include <rte_ether.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
+#include <rte_spinlock.h>
 
 #include "core/fc_mode.h"
 
@@ -20,6 +21,7 @@ typedef struct receiver_feedback_msg_s {
     uint64_t vc_bklg;
     uint32_t flags;
     struct rte_ether_addr dst_addr;
+    struct receiver_feedback_msg_s *pending_next;
 } receiver_feedback_msg_t;
 
 typedef struct receiver_config_s {
@@ -52,6 +54,9 @@ typedef struct receiver_vc_infiniflow_state_s {
     uint64_t backlog;
     uint32_t state;
     uint32_t pending_feedback_flags;
+    rte_spinlock_t pending_feedback_lock;
+    receiver_feedback_msg_t *pending_feedback_head;
+    receiver_feedback_msg_t *pending_feedback_tail;
 } receiver_vc_infiniflow_state_t;
 
 typedef struct receiver_port_infiniflow_state_s {
@@ -96,6 +101,7 @@ typedef struct receiver_ctx_s {
 
 int receiver_feedback_init(receiver_ctx_t *ctx);
 void receiver_feedback_cleanup(receiver_ctx_t *ctx);
+void receiver_feedback_note_ta(receiver_ctx_t *ctx, uint32_t vc_id);
 void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_addr *dst_addr,
                                    uint32_t vc_id, uint64_t fccl, uint64_t vc_dr,
                                    uint64_t vc_bklg, uint32_t flags);

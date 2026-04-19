@@ -9,6 +9,7 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
+#include <rte_spinlock.h>
 
 #include "core/fc_header.h"
 #include "core/fc_mode.h"
@@ -18,6 +19,8 @@
 #define SWITCH_MAX_EGRESS_PORTS 8U
 #define SWITCH_MAX_ROUTE_CSV_PATH 512U
 
+struct switch_feedback_msg_s;
+
 typedef struct switch_ingress_vc_state_s {
     uint64_t occupancy;
     uint64_t capacity;
@@ -25,6 +28,9 @@ typedef struct switch_ingress_vc_state_s {
     uint64_t total_drained;
     uint32_t state;
     uint32_t pending_feedback_flags;
+    rte_spinlock_t pending_feedback_lock;
+    struct switch_feedback_msg_s *pending_feedback_head;
+    struct switch_feedback_msg_s *pending_feedback_tail;
 } switch_ingress_vc_state_t;
 
 typedef struct switch_egress_vc_state_s {
@@ -55,6 +61,7 @@ typedef struct switch_feedback_msg_s {
     uint64_t vc_bklg;
     uint32_t flags;
     struct rte_ether_addr dst_addr;
+    struct switch_feedback_msg_s *pending_next;
 } switch_feedback_msg_t;
 
 typedef struct switch_vc_stats_s {
@@ -141,6 +148,7 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);
 uint32_t switch_forward_run_tick(switch_ctx_t *ctx, uint16_t egress_idx);
 uint32_t switch_feedback_gen_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx);
 uint32_t switch_feedback_handler_run_tick(switch_ctx_t *ctx);
+void switch_feedback_note_ta(switch_ctx_t *ctx, uint16_t ingress_idx, uint32_t vc_id);
 
 int switch_route_table_load(switch_ctx_t *ctx);
 void switch_route_table_reset(switch_ctx_t *ctx);

@@ -110,9 +110,7 @@ int switch_scheduler_run_tick(switch_ctx_t *ctx, uint16_t ingress_idx) {
             }
 
             if ((flags & FC_DATA_FLAG_TA) != 0U) {
-                __atomic_store_n(&ingress_state->state, 1U, __ATOMIC_RELEASE);
-                __atomic_fetch_or(&ingress_state->pending_feedback_flags, INFINIFLOW_FEEDBACK_FLAG_TA,
-                                  __ATOMIC_RELAXED);
+                switch_feedback_note_ta(ctx, ingress_idx, vc_id);
             }
 
             egress_queue_idx = switch_egress_vc_state_index(ctx, egress_idx, vc_id);

@@ -12,6 +12,104 @@
 #include <rte_mbuf.h>
 #include <rte_ring.h>
 
+static receiver_vc_infiniflow_state_t *receiver_get_infiniflow_vc_state(receiver_ctx_t *ctx,
+                                                                        uint32_t vc_id) {
+    if (ctx->cfg.fc_mode != FC_MODE_INFINIFLOW || ctx->vc_infiniflow_states == NULL ||
+        vc_id >= ctx->cfg.nb_vc) {
+        return NULL;
+    }
+
+    return &ctx->vc_infiniflow_states[vc_id];
+}
+
+static void receiver_feedback_append_pending_locked(receiver_vc_infiniflow_state_t *vc_state,
+                                                    receiver_feedback_msg_t *msg) {
+    msg->pending_next = NULL;
+    if (vc_state->pending_feedback_tail == NULL) {
+        vc_state->pending_feedback_head = msg;
+        vc_state->pending_feedback_tail = msg;
+        return;
+    }
+
+    vc_state->pending_feedback_tail->pending_next = msg;
+    vc_state->pending_feedback_tail = msg;
+}
+
+static void receiver_feedback_detach_pending_locked(receiver_vc_infiniflow_state_t *vc_state,
+                                                    receiver_feedback_msg_t *msg) {
+    receiver_feedback_msg_t *prev = NULL;
+    receiver_feedback_msg_t *cur = vc_state->pending_feedback_head;
+
+    while (cur != NULL) {
+        if (cur == msg) {
+            if (prev == NULL) {
+                vc_state->pending_feedback_head = cur->pending_next;
+            } else {
+                prev->pending_next = cur->pending_next;
+            }
+            if (vc_state->pending_feedback_tail == cur) {
+                vc_state->pending_feedback_tail = prev;
+            }
+            cur->pending_next = NULL;
+            return;
+        }
+        prev = cur;
+        cur = cur->pending_next;
+    }
+}
+
+static void receiver_feedback_bind_pending_flags_locked(receiver_vc_infiniflow_state_t *vc_state,
+                                                        receiver_feedback_msg_t *msg) {
+    uint32_t pending_flags = vc_state->pending_feedback_flags;
+
+    if (pending_flags == 0U) {
+        return;
+    }
+
+    if (vc_state->pending_feedback_head != NULL) {
+        vc_state->pending_feedback_head->flags |= pending_flags;
+    } else {
+        msg->flags |= pending_flags;
+    }
+
+    vc_state->pending_feedback_flags = 0U;
+    if ((pending_flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
+        vc_state->state = 0U;
+    }
+}
+
+static void receiver_feedback_restore_pending_locked(receiver_vc_infiniflow_state_t *vc_state,
+                                                     receiver_feedback_msg_t *msg, bool requeued) {
+    if (requeued) {
+        receiver_feedback_append_pending_locked(vc_state, msg);
+        return;
+    }
+
+    if ((msg->flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
+        vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+        vc_state->state = 1U;
+        msg->flags &= ~INFINIFLOW_FEEDBACK_FLAG_TA;
+    }
+}
+
+void receiver_feedback_note_ta(receiver_ctx_t *ctx, uint32_t vc_id) {
+    receiver_vc_infiniflow_state_t *vc_state = receiver_get_infiniflow_vc_state(ctx, vc_id);
+
+    if (vc_state == NULL) {
+        return;
+    }
+
+    rte_spinlock_lock(&vc_state->pending_feedback_lock);
+    vc_state->state = 1U;
+    if (vc_state->pending_feedback_head != NULL) {
+        vc_state->pending_feedback_head->flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+        vc_state->state = 0U;
+    } else {
+        vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+    }
+    rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+}
+
 int receiver_feedback_init(receiver_ctx_t *ctx) {
     uint32_t j = 0;
     unsigned int feedback_ring_flags = RING_F_SC_DEQ | RING_F_EXACT_SZ;
@@ -84,6 +182,7 @@ void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_a
                                    uint32_t vc_id, uint64_t fccl, uint64_t vc_dr,
                                    uint64_t vc_bklg, uint32_t flags) {
     receiver_feedback_msg_t *msg = NULL;
+    receiver_vc_infiniflow_state_t *vc_state = NULL;
 
     if (ctx->feedback_ring == NULL || ctx->feedback_free_ring == NULL) {
         return;
@@ -99,9 +198,28 @@ void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_a
     msg->vc_dr = vc_dr;
     msg->vc_bklg = vc_bklg;
     msg->flags = flags;
+    msg->pending_next = NULL;
     rte_ether_addr_copy(dst_addr, &msg->dst_addr);
 
+    vc_state = receiver_get_infiniflow_vc_state(ctx, vc_id);
+    if (vc_state != NULL) {
+        rte_spinlock_lock(&vc_state->pending_feedback_lock);
+        receiver_feedback_bind_pending_flags_locked(vc_state, msg);
+        receiver_feedback_append_pending_locked(vc_state, msg);
+        rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+    }
+
     if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
+        if (vc_state != NULL) {
+            rte_spinlock_lock(&vc_state->pending_feedback_lock);
+            receiver_feedback_detach_pending_locked(vc_state, msg);
+            if ((msg->flags & INFINIFLOW_FEEDBACK_FLAG_TA) != 0U) {
+                vc_state->pending_feedback_flags |= INFINIFLOW_FEEDBACK_FLAG_TA;
+                vc_state->state = 1U;
+                msg->flags &= ~INFINIFLOW_FEEDBACK_FLAG_TA;
+            }
+            rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+        }
         if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
             RTE_LOG(ERR, USER1, "receiver: failed to return feedback msg to free ring\n");
         }
@@ -112,6 +230,7 @@ void receiver_feedback_try_enqueue(receiver_ctx_t *ctx, const struct rte_ether_a
 uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
     struct rte_mbuf *tx_pkts[256];
     receiver_feedback_msg_t *tx_msgs[256];
+    receiver_vc_infiniflow_state_t *vc_state = NULL;
     uint32_t burst = (ctx->cfg.tx_burst_size > 256U) ? 256U : ctx->cfg.tx_burst_size;
     uint32_t prepared = 0;
     uint16_t tx_count = 0;
@@ -134,9 +253,23 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
             break;
         }
 
+        vc_state = receiver_get_infiniflow_vc_state(ctx, msg->vc_id);
+        if (vc_state != NULL) {
+            rte_spinlock_lock(&vc_state->pending_feedback_lock);
+            receiver_feedback_detach_pending_locked(vc_state, msg);
+            rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+        }
+
         mbuf = rte_pktmbuf_alloc(ctx->mbuf_pool);
         if (mbuf == NULL) {
-            if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
+            int requeue_ok = rte_ring_mp_enqueue(ctx->feedback_ring, msg) == 0 ? 1 : 0;
+
+            if (vc_state != NULL) {
+                rte_spinlock_lock(&vc_state->pending_feedback_lock);
+                receiver_feedback_restore_pending_locked(vc_state, msg, requeue_ok != 0);
+                rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+            }
+            if (!requeue_ok) {
                 if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
                     RTE_LOG(ERR, USER1, "receiver: failed to recycle feedback msg after mbuf OOM\n");
                 }
@@ -151,8 +284,16 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
 
         packet = rte_pktmbuf_append(mbuf, packet_len);
         if (packet == NULL) {
+            int requeue_ok = 0;
+
             rte_pktmbuf_free(mbuf);
-            if (rte_ring_mp_enqueue(ctx->feedback_ring, msg) != 0) {
+            requeue_ok = rte_ring_mp_enqueue(ctx->feedback_ring, msg) == 0 ? 1 : 0;
+            if (vc_state != NULL) {
+                rte_spinlock_lock(&vc_state->pending_feedback_lock);
+                receiver_feedback_restore_pending_locked(vc_state, msg, requeue_ok != 0);
+                rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+            }
+            if (!requeue_ok) {
                 if (rte_ring_mp_enqueue(ctx->feedback_free_ring, msg) != 0) {
                     RTE_LOG(ERR, USER1, "receiver: failed to recycle feedback msg after append fail\n");
                 }
@@ -199,7 +340,19 @@ uint32_t receiver_feedback_tx_run_tick(receiver_ctx_t *ctx) {
 
     for (i = (uint32_t)tx_count; i < prepared; i++) {
         rte_pktmbuf_free(tx_pkts[i]);
+        vc_state = receiver_get_infiniflow_vc_state(ctx, tx_msgs[i]->vc_id);
+        if (vc_state != NULL) {
+            rte_spinlock_lock(&vc_state->pending_feedback_lock);
+            receiver_feedback_restore_pending_locked(vc_state, tx_msgs[i], true);
+            rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+        }
         if (rte_ring_mp_enqueue(ctx->feedback_ring, tx_msgs[i]) != 0) {
+            if (vc_state != NULL) {
+                rte_spinlock_lock(&vc_state->pending_feedback_lock);
+                receiver_feedback_detach_pending_locked(vc_state, tx_msgs[i]);
+                receiver_feedback_restore_pending_locked(vc_state, tx_msgs[i], false);
+                rte_spinlock_unlock(&vc_state->pending_feedback_lock);
+            }
             if (rte_ring_mp_enqueue(ctx->feedback_free_ring, tx_msgs[i]) != 0) {
                 RTE_LOG(ERR, USER1, "receiver: failed to recycle unsent feedback msg\n");
             }
